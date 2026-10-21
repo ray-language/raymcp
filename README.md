@@ -138,6 +138,7 @@ make demo          # un turno del agente con el modelo con guion
 | Hallazgos, servidor, cliente, agente | **17 tests** en VM y nativo (raylang 1.27.65; agent, llm y mcp 0.2.0; net 0.10.1) |
 | De punta a punta | modelo con guion → agente → cliente MCP → `raymcp serve` en otro proceso → archivos: búsqueda, aprobación sí y no, `auto`, streaming, reintentos (500, 429), cancelación y el límite de pasos |
 | Sobre los hallazgos reales | `tools`, `call` y `ask --fake` sobre los 221 hallazgos; el resumen coincide con `INDEX.md` |
+| Windows x86_64 nativo | los tests del agente se saltan: el modelo con guion es un servidor HTTP, y allí `accept` bloquea el hilo de su worker (#222, encontrado en raystat) |
 | Un modelo de verdad | **sin probar**: en esta máquina no hay clave de Anthropic ni modelo local |
 | Claude Code como cliente | sin probar (el comando para registrarlo está arriba) |
 
