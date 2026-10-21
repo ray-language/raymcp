@@ -1,7 +1,6 @@
 import std/fs;
 import std/json;
 import std/time;
-import std/process;
 import agent/agent;
 import fakemodel;
 import ask;
@@ -23,12 +22,13 @@ fn options(url: string, root: string) -> ask.Options {
     }
 }
 
-/// The scripted model is an HTTP server, and on native Windows x86_64 its accept holds a worker's
-/// thread: the fibers there never run again and the test would hang (finding #222).
+/// The scripted model is an HTTP server, and on Windows a pending accept starves the rest: natively
+/// it holds a worker's thread, and on the VM the MCP child's replies never arrive while it waits
+/// (finding #222). The agent tests would hang or time out there.
 fn no_http_server() -> bool {
-    let skip = platform() == "windows" && process.launch_mode() == "native";
+    let skip = platform() == "windows";
     if (skip) {
-        eprint("skipped on native Windows: tcp_accept blocks its worker (#222)");
+        eprint("skipped on Windows: a pending accept starves the MCP session (#222)");
     }
     skip
 }
