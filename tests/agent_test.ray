@@ -1,0 +1,175 @@
+import std/fs;
+import std/json;
+import std/time;
+import agent/agent;
+import fakemodel;
+import ask;
+
+const ROOT: string = "tests/fixtures/apps";
+
+fn options(url: string, root: string) -> ask.Options {
+    ask.Options {
+        root: root,
+        provider: "endpoint",
+        model: "fake",
+        endpoint: url,
+        key: "",
+        autonomy: agent.ASK,
+        stream: false,
+        approve: "",
+        max_steps: 10,
+        server_command: ask.default_server(root)
+    }
+}
+
+fn never() -> Channel<int> {
+    let c: Channel<int> = Channel.bounded(1);
+    c
+}
+
+const SEARCH_THEN_ANSWER: string = `[
+  {"tools":[{"name":"mcp__raymcp__search_findings","arguments":{"query":"canal"}}]},
+  {"text":"It is #3."}
+]`;
+
+@test
+fn a_turn_goes_model_tool_model() {
+    let m = fakemodel.start(SEARCH_THEN_ANSWER, 0).unwrap();
+    let s = ask.open(options(fakemodel.url(m), ROOT)).unwrap();
+    assert_eq(s.tools, 4);
+    let r = ask.turn(s, "which finding is about channels?", never()).unwrap();
+    assert_eq(r.text, "It is #3.");
+    assert_eq(r.stop, agent.DONE);
+    assert_eq(r.steps, 2);
+    let reqs = fakemodel.requests(m);
+    assert_eq(reqs.len(), 2);
+    // The first request offers the server's tools under their MCP names, with the system prompt
+    // and the server's instructions.
+    assert(reqs[0].contains("mcp__raymcp__add_finding"));
+    assert(reqs[0].contains("You are raymcp"));
+    assert(reqs[0].contains("Search before adding"));
+    // The second carries the tool's answer, which came from the server process.
+    assert(reqs[1].contains("#3 [B] abierto"));
+    ask.close(s);
+    fakemodel.stop(m);
+}
+
+const ADD: string = `[
+  {"tools":[{"name":"mcp__raymcp__add_finding","arguments":{"app":"raybeta","version":"1.27.65","type":"B","title":"Desde el agente","body":"Cuerpo."}}]},
+  {"text":"Done."}
+]`;
+
+@test
+fn writing_needs_a_yes() {
+    let tmp = fs.make_temp_dir("raymcp-test").unwrap();
+    fs.copy_all(ROOT, tmp).unwrap();
+    // Nobody to ask (--no): the call is declined, the model is told, nothing is written.
+    let m = fakemodel.start(ADD, 0).unwrap();
+    var o = options(fakemodel.url(m), tmp);
+    o.approve = "no";
+    let s = ask.open(o).unwrap();
+    let r = ask.turn(s, "file it", never()).unwrap();
+    assert_eq(r.stop, agent.DONE);
+    assert(!fs.exists("${tmp}/findings/open/raybeta-1.27.65.md"));
+    let reqs = fakemodel.requests(m);
+    assert(reqs[1].contains("tool_call_id"));
+    ask.close(s);
+    fakemodel.stop(m);
+    // With a yes it runs, through the server, and the file appears.
+    let m2 = fakemodel.start(ADD, 0).unwrap();
+    o = options(fakemodel.url(m2), tmp);
+    o.approve = "yes";
+    let s2 = ask.open(o).unwrap();
+    ask.turn(s2, "file it", never()).unwrap();
+    let text = fs.read_file("${tmp}/findings/open/raybeta-1.27.65.md").unwrap();
+    assert(text.contains("### 6. [B] Desde el agente"));
+    assert(fakemodel.requests(m2)[1].contains("#6 added"));
+    ask.close(s2);
+    fakemodel.stop(m2);
+    fs.remove_all(tmp);
+}
+
+@test
+fn autonomy_auto_runs_without_asking() {
+    let tmp = fs.make_temp_dir("raymcp-test").unwrap();
+    fs.copy_all(ROOT, tmp).unwrap();
+    let m = fakemodel.start(ADD, 0).unwrap();
+    var o = options(fakemodel.url(m), tmp);
+    o.autonomy = agent.AUTO;
+    o.approve = "no";
+    let s = ask.open(o).unwrap();
+    ask.turn(s, "file it", never()).unwrap();
+    assert(fs.exists("${tmp}/findings/open/raybeta-1.27.65.md"));
+    ask.close(s);
+    fakemodel.stop(m);
+    fs.remove_all(tmp);
+}
+
+@test
+fn streaming_gives_the_same_answer() {
+    let m = fakemodel.start(SEARCH_THEN_ANSWER, 0).unwrap();
+    var o = options(fakemodel.url(m), ROOT);
+    o.stream = true;
+    let s = ask.open(o).unwrap();
+    let r = ask.turn(s, "which?", never()).unwrap();
+    assert_eq(r.text, "It is #3.");
+    assert_eq(r.steps, 2);
+    assert(fakemodel.requests(m)[0].contains(`"stream":true`));
+    ask.close(s);
+    fakemodel.stop(m);
+}
+
+@test
+fn errors_worth_retrying_are_retried() {
+    let m = fakemodel.start(`[{"status":500},{"status":429,"retry_after":1},{"text":"Third time."}]`, 0)
+        .unwrap();
+    let s = ask.open(options(fakemodel.url(m), ROOT)).unwrap();
+    let r = ask.turn(s, "hello", never()).unwrap();
+    assert_eq(r.text, "Third time.");
+    assert_eq(fakemodel.requests(m).len(), 3);
+    ask.close(s);
+    fakemodel.stop(m);
+    // A 400 is not retried: the turn is an Err.
+    let m2 = fakemodel.start(`[{"status":400}]`, 0).unwrap();
+    let s2 = ask.open(options(fakemodel.url(m2), ROOT)).unwrap();
+    let e = ask.turn(s2, "hello", never());
+    assert(e.is_err());
+    assert_eq(fakemodel.requests(m2).len(), 1);
+    ask.close(s2);
+    fakemodel.stop(m2);
+}
+
+@test
+fn a_slow_turn_can_be_cancelled() {
+    let m = fakemodel.start(`[{"delay_ms":3000,"text":"too late"}]`, 0).unwrap();
+    let s = ask.open(options(fakemodel.url(m), ROOT)).unwrap();
+    let cancel: Channel<int> = Channel.bounded(1);
+    spawn(fn() {
+        time.sleep(200);
+        send(cancel, 1);
+    });
+    let t0 = time.now();
+    let r = ask.turn(s, "slow", cancel).unwrap();
+    assert_eq(r.stop, agent.CANCELLED);
+    assert(time.now() - t0 < 2000);
+    ask.close(s);
+    fakemodel.stop(m);
+}
+
+@test
+fn the_step_budget_stops_a_loop() {
+    // A model that only ever calls tools.
+    var steps: [string] = [];
+    for i in 0..5 {
+        steps.push(`{"tools":[{"name":"mcp__raymcp__findings_summary","arguments":{}}]}`);
+    }
+    let m = fakemodel.start("[" + steps.join(",") + "]", 0).unwrap();
+    var o = options(fakemodel.url(m), ROOT);
+    o.max_steps = 3;
+    let s = ask.open(o).unwrap();
+    let r = ask.turn(s, "loop", never()).unwrap();
+    assert_eq(r.stop, agent.MAX_STEPS);
+    assert_eq(r.steps, 3);
+    ask.close(s);
+    fakemodel.stop(m);
+}

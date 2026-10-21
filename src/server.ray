@@ -1,0 +1,151 @@
+//! The MCP server: the findings of ray-apps as tools and resources. Every call reads the files
+//! again, so what another process (or a person) wrote meanwhile is already there.
+
+import std/fs;
+import std/json;
+import std/process;
+import mcp/serve;
+import findings;
+from std/json import Json;
+from mcp/serve import Provider;
+
+pub const VERSION: string = "0.1.0";
+
+const INSTRUCTIONS: string = `Findings are what the ray-apps (dogfooding apps written in raylang) found in raylang and its packages: bugs (B), documentation gaps (D) and ergonomics (E). Each has a global number. Search before adding: if the same problem is already filed, cite its number instead. A new finding needs the app that found it, the raylang version, the type, a one-line title and a body that says what was done, what was expected and what happened, with a minimal repro.`;
+
+const SEARCH_SCHEMA: string = `{"type":"object","properties":{
+"query":{"type":"string","description":"Words that must all appear in the entry (case-insensitive). Empty = everything."},
+"type":{"type":"string","enum":["B","D","E"],"description":"Only this type"},
+"app":{"type":"string","description":"Only findings from this app (rayffi, raystat…)"},
+"affects":{"type":"string","description":"Only findings this component must fix (raylang, net, ray-elements…)"},
+"status":{"type":"string","enum":["open","closed","any"],"description":"Default any"},
+"limit":{"type":"integer","minimum":1,"maximum":100,"description":"Default 20"}}}`;
+
+const GET_SCHEMA: string = `{"type":"object","properties":{"number":{"type":"integer","minimum":1}},"required":["number"]}`;
+
+const ADD_SCHEMA: string = `{"type":"object","properties":{
+"app":{"type":"string","description":"The app that found it"},
+"version":{"type":"string","description":"raylang version measured, X.Y.Z"},
+"versions":{"type":"string","description":"Other versions involved, e.g. 'net 0.10.1'"},
+"type":{"type":"string","description":"B, D, E or a combination like D/E"},
+"title":{"type":"string","description":"One line, in Spanish, saying what fails"},
+"affects":{"type":"string","description":"Who must fix it; default raylang"},
+"body":{"type":"string","description":"Markdown, in Spanish: what was done, expected, happened; minimal repro; proposal"},
+"measured":{"type":"string","description":"How it was measured, for a new campaign file"}},
+"required":["app","version","type","title","body"]}`;
+
+fn dir_of(root: string) -> string {
+    "${root}/findings"
+}
+
+fn load(root: string) -> Result<[findings.Entry], string> {
+    findings.load(dir_of(root))
+}
+
+fn text(args: Json, key: string) -> string {
+    json.get_string(args, key).unwrap_or("")
+}
+
+pub fn search(root: string, args: Json) -> Result<string, string> {
+    let entries = load(root)?;
+    var q = findings.query(text(args, "query"));
+    q.kind = text(args, "type");
+    q.app = text(args, "app");
+    q.affects = text(args, "affects");
+    let st = text(args, "status");
+    q.state = if (st == "any") { "" } else { st };
+    q.limit = json.get_int(args, "limit").unwrap_or(20);
+    if (q.limit < 1) {
+        return Result.Err("limit must be at least 1");
+    }
+    let (hits, total) = findings.search(entries, q);
+    if (total == 0) {
+        return Result.Ok("No findings match.");
+    }
+    let shown = if (total > hits.len()) { " (showing the ${hits.len()} newest)" } else { "" };
+    let lines = hits.map(fn(e: findings.Entry) -> string { findings.line(e) });
+    Result.Ok("${total} match${shown}:\n" + lines.join("\n"))
+}
+
+pub fn get(root: string, args: Json) -> Result<string, string> {
+    let n = match (json.get_int(args, "number")) {
+        Option.Some(n) => n,
+        Option.None => return Result.Err("'number' is required (an integer)"),
+    };
+    let entries = load(root)?;
+    match (findings.find(entries, n)) {
+        Option.Some(e) => Result.Ok("${e.file}, ${findings.status(e)}\n\n${e.text}"),
+        Option.None => Result.Err("there is no finding #${n}"),
+    }
+}
+
+pub fn summary(root: string) -> Result<string, string> {
+    let entries = load(root)?;
+    Result.Ok(findings.summary(entries))
+}
+
+fn apps(root: string) -> [string] {
+    fs.list_dir(root).unwrap_or([]).filter(fn(n: string) -> bool {
+        !n.starts_with(".") && n != "findings" && fs.is_dir("${root}/${n}")
+    })
+}
+
+/// Regenerates INDEX.md with the repo's own tool, if it is there.
+fn reindex(root: string) -> string {
+    if (!fs.exists("${root}/tools/findings.py")) {
+        return "INDEX.md not regenerated (no tools/findings.py here).";
+    }
+    match (process.cmd("python3", ["tools/findings.py", "index"])
+        .dir(root)
+        .timeout_ms(30000)
+        .run()) {
+        Result.Ok(out) => match (out.exit) {
+            process.Exit.Code(0) => from_utf8(out.stdout).unwrap_or("").trim(),
+            _ => "INDEX.md not regenerated: ${from_utf8(out.stderr).unwrap_or("").trim()}",
+        },
+        Result.Err(e) => "INDEX.md not regenerated: ${e}",
+    }
+}
+
+pub fn add(root: string, args: Json) -> Result<string, string> {
+    let n = findings.NewEntry {
+        app: text(args, "app"),
+        version: text(args, "version"),
+        versions: text(args, "versions"),
+        kind: text(args, "type").to_upper(),
+        title: text(args, "title"),
+        affects: text(args, "affects"),
+        body: text(args, "body"),
+        measured: text(args, "measured")
+    };
+    let problem = findings.check(n, apps(root));
+    if (problem != "") {
+        return Result.Err(problem);
+    }
+    let entries = load(root)?;
+    // Same title already filed: almost surely the same finding.
+    for e in entries {
+        if (e.title.to_lower() == n.title.trim().to_lower()) {
+            return Result.Err("#${e.number} already has this title (${e.file}); cite it instead");
+        }
+    }
+    let (number, rel) = findings.add(dir_of(root), entries, n)?;
+    Result.Ok("#${number} added to findings/${rel}. ${reindex(root)}")
+}
+
+fn read_file(path: string) -> Result<string, string> {
+    fs.read_file(path)
+}
+
+/// The provider for the findings under `root` (the ray-apps directory).
+pub fn build(root: string) -> Provider {
+    var p = serve.provider("raymcp", VERSION);
+    p.instructions = INSTRUCTIONS;
+    serve.read_only_tool(p, "search_findings", "Searches the findings by words and filters. Returns one line per finding, newest first: number, type, status, app, versions, who must fix it, title and file.", SEARCH_SCHEMA, fn(args: Json) -> Result<string, string> { search(root, args) });
+    serve.read_only_tool(p, "get_finding", "The full text of one finding by its number, with its file and status.", GET_SCHEMA, fn(args: Json) -> Result<string, string> { get(root, args) });
+    serve.read_only_tool(p, "findings_summary", "How many findings there are, and the open ones by type, by component and by app.", "", fn(args: Json) -> Result<string, string> { summary(root) });
+    serve.tool(p, "add_finding", "Files a new finding with the next global number, in the campaign file of its app and raylang version, and regenerates the index. Search first: a duplicate title is refused.", ADD_SCHEMA, fn(args: Json) -> Result<string, string> { add(root, args) });
+    serve.resource(p, "findings://index", "Findings index", "INDEX.md: every finding in a table, the open ones first", "text/markdown", fn() -> Result<string, string> { read_file("${root}/findings/INDEX.md") });
+    serve.resource(p, "findings://convention", "Findings convention", "README.md of findings/: what is filed, types, format of an entry", "text/markdown", fn() -> Result<string, string> { read_file("${root}/findings/README.md") });
+    p
+}

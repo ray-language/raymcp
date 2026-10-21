@@ -1,0 +1,170 @@
+//! The client side: an agent that talks to a model and uses the findings server through MCP,
+//! as any MCP client would (a separate process over stdio), not through direct calls.
+
+import std/io;
+import std/time;
+import std/process;
+import agent/agent;
+import llm/llm;
+import mcp/mcp;
+from agent/agent import Decision, Event;
+from llm/message import ToolCall;
+from llm/config import Config;
+
+pub struct Options {
+    root: string,
+    /// "anthropic" or "endpoint".
+    provider: string,
+    model: string,
+    endpoint: string,
+    key: string,
+    autonomy: string,
+    stream: bool,
+    /// Answer every approval with this ("" = ask on the terminal).
+    approve: string,
+    max_steps: int,
+    /// The command that launches the server (this program with `serve`, unless told otherwise).
+    server_command: [string],
+}
+
+pub const SYSTEM: string = `You are raymcp, an assistant for the findings that the ray-apps (dogfooding apps written in raylang) file against raylang and its packages. Use the tools to look things up; quote finding numbers (#209) and files. Answer in the user's language, briefly. Only file a new finding when the user asks for it, and search first.`;
+
+/// How to launch the findings server: this same program, `serve --root ROOT`.
+pub fn default_server(root: string) -> [string] {
+    // Under a test suite this program cannot serve: `ray test` reports `[ray, test]`, and
+    // `ray test --native` the test binary, with launch_mode() "native" (finding #217). The
+    // suite's environment carries RAY_TEST=1 in both, so the server runs from the source.
+    if (env("RAY_TEST").unwrap_or("") == "1") {
+        return ["ray", "run", "src/main.ray", "serve", "--root", root];
+    }
+    process.self_command() + ["serve", "--root", root]
+}
+
+pub fn connect(command: [string]) -> Result<mcp.Session, string> {
+    if (command.len() == 0) {
+        return Result.Err("no server command");
+    }
+    var server = mcp.stdio_server("raymcp", command[0], command.slice(1, command.len()));
+    server.client_name = "raymcp";
+    mcp.connect(server)
+}
+
+pub fn config(o: Options) -> Result<Config, string> {
+    var c = if (o.provider == "endpoint") {
+        if (o.endpoint == "") {
+            return Result.Err("--endpoint needs a base URL (http://127.0.0.1:11434/v1)");
+        }
+        llm.for_endpoint(o.endpoint, o.model, o.key)
+    } else {
+        if (o.key == "") {
+            return Result.Err(
+                "no API key: set ANTHROPIC_API_KEY, or use --endpoint for a local model, or --fake SCRIPT"
+            );
+        }
+        llm.for_anthropic(o.model, o.key)
+    };
+    c.system = SYSTEM;
+    Result.Ok(c)
+}
+
+fn ask_terminal(call: ToolCall, risk: string) -> Decision {
+    io.ewrite(
+        "\nraymcp: ${call.name} (${risk}) with ${call.arguments}\n  run it? [y]es / [a]lways / [N]o: "
+    );
+    io.flush();
+    let answer = input().unwrap_or("").trim().to_lower();
+    if (answer == "y" || answer == "yes") {
+        Decision.Yes
+    } else {
+        if (answer == "a" || answer == "always") { Decision.Always } else { Decision.No }
+    }
+}
+
+fn fixed(answer: string) -> Decision {
+    if (answer == "yes") {
+        Decision.Yes
+    } else {
+        if (answer == "always") { Decision.Always } else { Decision.No }
+    }
+}
+
+fn short(s: string, n: int) -> string {
+    let one = s.replace("\n", " ⏎ ");
+    if (one.len() <= n) { one } else { one.substring(0, n) + "…" }
+}
+
+/// What a turn looks like on stderr: the calls and what came back; the streamed text on stdout.
+fn show(e: Event) {
+    match (e) {
+        Event.Thinking(step) => if (step > 1) {
+            eprint("  … step ${step}");
+        },
+        Event.Text(piece) => {
+            io.write(piece);
+            io.flush();
+        },
+        Event.Said(_) => { },
+        Event.Calling(call, risk) => eprint("  → ${call.name} ${short(call.arguments, 120)} (${risk})"),
+        Event.Returned(call, output, failed) => {
+            let mark = if (failed) { "✗" } else { "←" };
+            eprint("  ${mark} ${short(output, 160)}");
+        },
+        Event.Declined(call, why) => eprint("  ✗ ${call.name} declined: ${why}"),
+    }
+}
+
+pub struct Session {
+    agent: agent.Agent,
+    mcp: mcp.Session,
+    tools: int,
+}
+
+/// The agent, wired to the findings server.
+pub fn open(o: Options) -> Result<Session, string> {
+    let c = config(o)?;
+    let a = agent.new(c);
+    a.autonomy = o.autonomy;
+    a.stream = o.stream;
+    a.max_steps = o.max_steps;
+    let s = connect(o.server_command)?;
+    let n = match (agent.connect(a, "raymcp", s)) {
+        Result.Ok(n) => n,
+        Result.Err(e) => {
+            mcp.close(s);
+            return Result.Err(e);
+        },
+    };
+    let fixed_answer = o.approve;
+    if (fixed_answer == "") {
+        agent.on_approve(a, fn(call: ToolCall, risk: string) -> Decision { ask_terminal(call, risk) });
+    } else {
+        agent.on_approve(a, fn(call: ToolCall, risk: string) -> Decision { fixed(fixed_answer) });
+    }
+    agent.on_event(a, fn(e: Event) {
+        show(e);
+    });
+    Result.Ok(Session { agent: a, mcp: s, tools: n })
+}
+
+/// One turn. Ctrl-C (a message on `cancel`) abandons the wait for the model.
+pub fn turn(s: Session, prompt: string, cancel: Channel<int>) -> Result<agent.Outcome, string> {
+    let t0 = time.now();
+    let r = agent.run_cancellable(s.agent, prompt, cancel)?;
+    if (s.agent.stream) {
+        print("");
+    } else {
+        print(r.text);
+    }
+    let u = r.usage;
+    let tokens = if (u.measured) {
+        ", ${u.input_tokens} in / ${u.output_tokens} out tokens"
+    } else {
+        ""
+    };
+    eprint("  [${r.stop}, ${r.steps} step(s), ${time.now() - t0} ms${tokens}]");
+    Result.Ok(r)
+}
+
+pub fn close(s: Session) {
+    mcp.close(s.mcp);
+}

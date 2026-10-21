@@ -1,0 +1,334 @@
+//! raymcp: the findings of ray-apps over MCP, and an agent that uses them.
+
+import std/fs;
+import std/io;
+import std/json;
+import std/time;
+import mcp/mcp;
+import mcp/serve;
+import agent/agent;
+import server;
+import ask;
+import fakemodel;
+
+const USAGE: string = `raymcp — the ray-apps findings as an MCP server, and an agent that uses it
+
+usage:
+  raymcp serve [--root DIR] [--http HOST:PORT]   the MCP server (stdio by default)
+  raymcp tools [--root DIR]                      connect as a client and list what it offers
+  raymcp call TOOL [JSON] [--root DIR]           call one tool through MCP
+  raymcp ask [PROMPT] [options]                  the agent: one turn, or a conversation without PROMPT
+  raymcp fake-model SCRIPT [--port N]            a scripted OpenAI-compatible model (tests, demos)
+
+ask options:
+  --model M            default claude-opus-5-5 (Anthropic, key in ANTHROPIC_API_KEY)
+  --endpoint URL       an OpenAI-compatible server instead (Ollama: http://127.0.0.1:11434/v1)
+  --key-env VAR        where the key is (default ANTHROPIC_API_KEY, or none with --endpoint)
+  --fake SCRIPT        run against the scripted model in SCRIPT (a JSON file), no key needed
+  --autonomy LEVEL     ask (default), edits or auto: what runs without asking
+  --yes / --no         answer every approval (unattended); default: ask on the terminal
+  --stream             show the answer as it arrives
+  --steps N            model calls per turn (default 20)
+
+--root is the ray-apps directory (the one holding findings/); default $RAYMCP_ROOT, else the
+current directory if it has findings/, else its parent. Ctrl-C cancels a turn; twice quits.
+`;
+
+fn fail(msg: string) -> int {
+    eprint("raymcp: ${msg}");
+    1
+}
+
+fn option(a: [string], name: string) -> Option<string> {
+    for i in 0..a.len() {
+        if (a[i] == name && i + 1 < a.len()) {
+            return Option.Some(a[i + 1]);
+        }
+    }
+    Option.None
+}
+
+const VALUED: [string] = [
+    "--root",
+    "--http",
+    "--model",
+    "--endpoint",
+    "--key-env",
+    "--fake",
+    "--autonomy",
+    "--steps",
+    "--port"
+];
+
+fn positional(a: [string]) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    while (i < a.len()) {
+        if (VALUED.contains(a[i])) {
+            i = i + 2;
+        } else {
+            if (!a[i].starts_with("--")) {
+                out.push(a[i]);
+            }
+            i = i + 1;
+        }
+    }
+    out
+}
+
+fn root_of(a: [string]) -> string {
+    match (option(a, "--root")) {
+        Option.Some(r) => r,
+        Option.None => match (env("RAYMCP_ROOT")) {
+            Option.Some(r) => r,
+            Option.None => if (fs.is_dir("findings/open")) { "." } else { ".." },
+        },
+    }
+}
+
+fn cmd_serve(a: [string]) -> int {
+    let root = root_of(a);
+    if (!fs.is_dir("${root}/findings/open")) {
+        return fail("${root}: no findings/open here (use --root)");
+    }
+    match (option(a, "--http")) {
+        Option.Some(addr) => {
+            let parts = addr.split(":");
+            let port = parse_int(parts[parts.len() - 1]).unwrap_or(-1);
+            let host = if (parts.len() > 1) { parts[0] } else { "127.0.0.1" };
+            if (port < 0) {
+                return fail("--http wants HOST:PORT");
+            }
+            eprint(
+                "raymcp: MCP over HTTP on http://${host}:${port}/mcp, findings in ${root}/findings"
+            );
+            match (serve.http(fn() -> serve.Provider { server.build(root) }, host, port)) {
+                Result.Ok(_) => 0,
+                Result.Err(e) => fail(e),
+            }
+        },
+        Option.None => serve.stdio(server.build(root)),
+    }
+}
+
+fn client(a: [string]) -> Result<mcp.Session, string> {
+    ask.connect(ask.default_server(root_of(a)))
+}
+
+fn cmd_tools(a: [string]) -> int {
+    let c = match (client(a)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => return fail(e),
+    };
+    for t in mcp.tools(c).unwrap_or([]) {
+        let ro = if (t.read_only) { " (read-only)" } else { "" };
+        print("${t.name}${ro}: ${t.description}");
+    }
+    for r in mcp.resources(c).unwrap_or([]) {
+        print("${r.uri}: ${r.description}");
+    }
+    mcp.close(c);
+    0
+}
+
+fn cmd_call(a: [string]) -> int {
+    let p = positional(a);
+    if (p.len() < 1) {
+        return fail("call TOOL [JSON]");
+    }
+    let args = if (p.len() > 1) { p[1] } else { "{}" };
+    let c = match (client(a)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => return fail(e),
+    };
+    let r = mcp.call_json(c, p[0], args);
+    mcp.close(c);
+    match (r) {
+        Result.Ok(out) => {
+            print(out);
+            0
+        },
+        Result.Err(e) => fail(e),
+    }
+}
+
+/// Ctrl-C → a message on `cancel`; a second one within a second quits.
+fn forward_signals(cancel: Channel<int>) {
+    let sig = signals();
+    var last = 0;
+    while (true) {
+        match (recv(sig)) {
+            Option.Some(s) => {
+                if (s == 2 || s == 15) {
+                    let now = time.now();
+                    if (s == 15 || now - last < 1000) {
+                        eprint("\nraymcp: bye");
+                        exit(130);
+                    }
+                    last = now;
+                    eprint("\nraymcp: cancelled (Ctrl-C again to quit)");
+                    send(cancel, 1);
+                }
+            },
+            Option.None => break,
+        }
+    }
+}
+
+fn drain(ch: Channel<int>) {
+    while (true) {
+        match (try_recv(ch)) {
+            Received.Got(_) => { },
+            _ => break,
+        }
+    }
+}
+
+fn cmd_ask(a: [string]) -> int {
+    let root = root_of(a);
+    let fake_script = option(a, "--fake");
+    var fake: Option<fakemodel.Running> = Option.None;
+    var provider = "anthropic";
+    var endpoint = option(a, "--endpoint").unwrap_or("");
+    if (endpoint != "") {
+        provider = "endpoint";
+    }
+    match (fake_script) {
+        Option.Some(path) => {
+            let script = match (fs.read_file(path)) {
+                Result.Ok(s) => s,
+                Result.Err(e) => return fail("${path}: ${e}"),
+            };
+            match (fakemodel.start(script, 0)) {
+                Result.Ok(r) => {
+                    endpoint = fakemodel.url(r);
+                    provider = "endpoint";
+                    fake = Option.Some(r);
+                },
+                Result.Err(e) => return fail("${path}: ${e}"),
+            }
+        },
+        Option.None => { },
+    }
+    let key_env = option(a, "--key-env").unwrap_or(
+        if (provider == "endpoint") { "" } else { "ANTHROPIC_API_KEY" }
+    );
+    let autonomy = option(a, "--autonomy").unwrap_or("ask");
+    let levels = [agent.ASK, agent.EDITS, agent.AUTO];
+    if (!levels.contains(autonomy)) {
+        return fail("--autonomy is ask, edits or auto");
+    }
+    let approve = if (a.contains("--yes")) { "yes" } else {
+        if (a.contains("--no")) { "no" } else { "" }
+    };
+    let o = ask.Options {
+        root: root,
+        provider: provider,
+        model: option(a, "--model").unwrap_or(if (fake.is_some()) { "fake" } else { "claude-opus-5-5" }),
+        endpoint: endpoint,
+        key: if (key_env == "") { "" } else { env(key_env).unwrap_or("") },
+        autonomy: autonomy,
+        stream: a.contains("--stream"),
+        approve: approve,
+        max_steps: option(a, "--steps").and_then(fn(s: string) -> Option<int> { parse_int(s) }).unwrap_or(20),
+        server_command: ask.default_server(root)
+    };
+    let s = match (ask.open(o)) {
+        Result.Ok(s) => s,
+        Result.Err(e) => return fail(e),
+    };
+    eprint(
+        "raymcp: ${s.tools} tools from the findings server; model ${o.model}; autonomy ${autonomy}"
+    );
+    let cancel: Channel<int> = Channel.bounded(8);
+    spawn(fn() {
+        forward_signals(cancel);
+    });
+    let p = positional(a);
+    var status = 0;
+    if (p.len() > 0) {
+        match (ask.turn(s, p.join(" "), cancel)) {
+            Result.Ok(_) => { },
+            Result.Err(e) => status = fail(e),
+        }
+    } else {
+        while (true) {
+            io_prompt();
+            match (input()) {
+                Option.Some(line) => {
+                    let q = line.trim();
+                    if (q == "exit" || q == "quit") {
+                        break;
+                    }
+                    if (q != "") {
+                        drain(cancel);
+                        match (ask.turn(s, q, cancel)) {
+                            Result.Ok(_) => { },
+                            Result.Err(e) => eprint("raymcp: ${e}"),
+                        }
+                    }
+                },
+                Option.None => break,
+            }
+        }
+    }
+    ask.close(s);
+    match (fake) {
+        Option.Some(r) => fakemodel.stop(r),
+        Option.None => { },
+    }
+    status
+}
+
+fn io_prompt() {
+    io.ewrite("\n› ");
+    io.flush();
+}
+
+fn cmd_fake(a: [string]) -> int {
+    let p = positional(a);
+    if (p.len() != 1) {
+        return fail("fake-model SCRIPT [--port N]");
+    }
+    let script = match (fs.read_file(p[0])) {
+        Result.Ok(s) => s,
+        Result.Err(e) => return fail("${p[0]}: ${e}"),
+    };
+    let port = option(a, "--port")
+        .and_then(fn(s: string) -> Option<int> { parse_int(s) })
+        .unwrap_or(0);
+    match (fakemodel.start(script, port)) {
+        Result.Ok(r) => {
+            print("fake model at ${fakemodel.url(r)} (Ctrl-C to stop)");
+            let sig = signals();
+            recv(sig);
+            fakemodel.stop(r);
+            0
+        },
+        Result.Err(e) => fail(e),
+    }
+}
+
+fn main() -> int {
+    let a = args();
+    if (a.len() == 0) {
+        print(USAGE);
+        return 2;
+    }
+    let rest = a.slice(1, a.len());
+    match (a[0]) {
+        "serve" => cmd_serve(rest),
+        "tools" => cmd_tools(rest),
+        "call" => cmd_call(rest),
+        "ask" => cmd_ask(rest),
+        "fake-model" => cmd_fake(rest),
+        "help" => {
+            print(USAGE);
+            0
+        },
+        _ => {
+            eprint(USAGE);
+            2
+        },
+    }
+}

@@ -1,0 +1,206 @@
+//! A scripted model that speaks the OpenAI Chat Completions dialect, for tests and demos without
+//! an API key. The script is a JSON array of steps; each request to `/chat/completions` gets the
+//! next one:
+//!
+//!   {"text": "…"}                                   an answer
+//!   {"tools": [{"name": "…", "arguments": {…}}]}    tool calls (with optional "text")
+//!   {"status": 429, "retry_after": 1}               an error status (retries, rate limits)
+//!   {"delay_ms": 3000, …}                           answer late (timeouts, cancellation)
+//!
+//! When the script runs out, every request gets `{"text": "(script exhausted)"}`. Handlers get a
+//! copy of what they capture, so the position in the script and the log of requests live in one
+//! actor fiber that the handlers ask through a channel.
+
+import std/json;
+import std/net;
+import std/time;
+import net/webserver;
+from std/json import Json;
+
+pub enum Ask {
+    /// The request body; the reply is the step to play.
+    Next(string, Channel<Json>),
+    /// Every request body so far.
+    Log(Channel<[string]>),
+    Stop,
+}
+
+fn exhausted() -> Json {
+    json.parse(`{"text":"(script exhausted)"}`).unwrap()
+}
+
+/// Owns the script and the log.
+pub fn actor(steps: [Json], inbox: Channel<Ask>) {
+    var at = 0;
+    var log: [string] = [];
+    while (true) {
+        match (recv(inbox)) {
+            Option.Some(Ask.Next(body, reply)) => {
+                log.push(body);
+                if (at < steps.len()) {
+                    send(reply, steps[at]);
+                    at = at + 1;
+                } else {
+                    send(reply, exhausted());
+                }
+            },
+            Option.Some(Ask.Log(reply)) => send(reply, log),
+            Option.Some(Ask.Stop) => break,
+            Option.None => break,
+        }
+    }
+}
+
+fn str(s: string) -> string {
+    json.stringify(Json.JStr(s))
+}
+
+fn tool_calls(step: Json, streaming: bool) -> [string] {
+    var out: [string] = [];
+    var i = 0;
+    for t in json.get_array(step, "tools")
+        .unwrap_or([]) {
+        let name = json.get_string(t, "name").unwrap_or("");
+        let args = match (json.member(t, "arguments")) {
+            Option.Some(a) => json.stringify(a),
+            Option.None => "{}",
+        };
+        let index = if (streaming) { `"index":${i},` } else { "" };
+        out.push(
+            `{${index}"id":"call_${i + 1}","type":"function","function":{"name":${str(name)},"arguments":${str(args)}}}`
+        );
+        i = i + 1;
+    }
+    out
+}
+
+const USAGE: string = `{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}`;
+
+/// The whole JSON answer for `step`.
+pub fn completion(step: Json) -> string {
+    let calls = tool_calls(step, false);
+    let content = match (json.get_string(step, "text")) {
+        Option.Some(t) => str(t),
+        Option.None => "null",
+    };
+    let finish = if (calls.len() > 0) { "tool_calls" } else { "stop" };
+    let tc = if (calls.len() > 0) { `,"tool_calls":[${calls.join(",")}]` } else { "" };
+    `{"id":"chatcmpl-fake","object":"chat.completion","model":"fake","choices":[{"index":0,"message":{"role":"assistant","content":${content}${tc}},"finish_reason":"${finish}"}],"usage":${USAGE}}`
+}
+
+/// The same answer as server-sent events: the text in pieces, then the calls, then the end.
+pub fn completion_stream(step: Json) -> string {
+    var events: [string] = [];
+    let head = `{"id":"chatcmpl-fake","object":"chat.completion.chunk","model":"fake","choices":[{"index":0,"delta":`;
+    events.push(head + `{"role":"assistant","content":""}}]}`);
+    match (json.get_string(step, "text")) {
+        Option.Some(t) => {
+            for w in t.split(" ") {
+                let piece = if (events.len() == 1) { w } else { " " + w };
+                events.push(head + `{"content":${str(piece)}}}]}`);
+            }
+        },
+        Option.None => { },
+    }
+    let calls = tool_calls(step, true);
+    if (calls.len() > 0) {
+        events.push(head + `{"tool_calls":[${calls.join(",")}]}}]}`);
+    }
+    let finish = if (calls.len() > 0) { "tool_calls" } else { "stop" };
+    events.push(
+        `{"id":"chatcmpl-fake","object":"chat.completion.chunk","model":"fake","choices":[{"index":0,"delta":{},"finish_reason":"${finish}"}],"usage":${USAGE}}`
+    );
+    events.map(fn(e: string) -> string { "data: ${e}\n\n" }).join("") + "data: [DONE]\n\n"
+}
+
+fn handle(req: webserver.Request, inbox: Channel<Ask>) -> webserver.Response {
+    if (req.method != "POST" || !req.path.ends_with("/chat/completions")) {
+        return webserver.not_found();
+    }
+    let body = from_utf8(req.body).unwrap_or("");
+    let reply: Channel<Json> = Channel.bounded(1);
+    send(inbox, Ask.Next(body, reply));
+    let step = recv(reply).unwrap_or(exhausted());
+    let delay = json.get_int(step, "delay_ms").unwrap_or(0);
+    if (delay > 0) {
+        time.sleep(delay);
+    }
+    let status = json.get_int(step, "status").unwrap_or(200);
+    if (status != 200) {
+        var r = webserver.json_response(
+            `{"error":{"message":"fake error ${status}","type":"fake"}}`
+        );
+        r.status = status;
+        match (json.get_int(step, "retry_after")) {
+            Option.Some(s) => r.headers.insert("retry-after", to_string(s)),
+            Option.None => { },
+        }
+        return r;
+    }
+    let streaming = match (json.parse(body)) {
+        Result.Ok(b) => json.get_bool(b, "stream").unwrap_or(false),
+        Result.Err(_) => false,
+    };
+    if (streaming) {
+        var r = webserver.text(200, completion_stream(step));
+        r.headers.insert("content-type", "text/event-stream");
+        r
+    } else {
+        webserver.json_response(completion(step))
+    }
+}
+
+pub struct Running {
+    port: int,
+    inbox: Channel<Ask>,
+    stop: Channel<int>,
+    done: Channel<Result<int, string>>,
+}
+
+/// Starts the fake on 127.0.0.1:`port` (0 = any free port) with `script` (JSON array text).
+pub fn start(script: string, port: int) -> Result<Running, string> {
+    let parsed = json.parse(script)?;
+    let steps = match (json.as_array(parsed)) {
+        Option.Some(a) => a,
+        Option.None => return Result.Err("the script must be a JSON array of steps"),
+    };
+    let listener = net.tcp_listen("127.0.0.1", port)?;
+    let inbox: Channel<Ask> = Channel.new();
+    let stop: Channel<int> = Channel.new();
+    let done: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        actor(steps, inbox);
+    });
+    spawn(fn() {
+        let opts = webserver.options();
+        opts.stop = stop;
+        opts.has_stop = true;
+        opts.no_stdout = true;
+        opts.drain_ms = 100;
+        send(
+            done,
+            webserver.serve_options_on(listener, opts, fn() -> fn(webserver.Request) -> webserver.Response {
+                fn(req: webserver.Request) -> webserver.Response { handle(req, inbox) }
+            })
+        );
+    });
+    Result.Ok(Running { port: net.local_port(listener), inbox: inbox, stop: stop, done: done })
+}
+
+/// The base URL for `llm.for_endpoint`.
+pub fn url(r: Running) -> string {
+    "http://127.0.0.1:${r.port}/v1"
+}
+
+/// Every request body the fake received, in order.
+pub fn requests(r: Running) -> [string] {
+    let reply: Channel<[string]> = Channel.bounded(1);
+    send(r.inbox, Ask.Log(reply));
+    recv(reply).unwrap_or([])
+}
+
+pub fn stop(r: Running) {
+    send(r.stop, 1);
+    recv(r.done);
+    send(r.inbox, Ask.Stop);
+}

@@ -1,0 +1,107 @@
+import std/fs;
+import std/json;
+import mcp/serve;
+import mcp/mcp;
+import server;
+import ask;
+
+const ROOT: string = "tests/fixtures/apps";
+
+fn rpc(id: int, method: string, params: string) -> string {
+    `{"jsonrpc":"2.0","id":${id},"method":"${method}","params":${params}}`
+}
+
+fn call_line(id: int, tool: string, args: string) -> string {
+    rpc(id, "tools/call", `{"name":"${tool}","arguments":${args}}`)
+}
+
+/// The text and the isError of a tools/call reply line.
+fn result_of(line: string) -> (string, bool) {
+    let j = json.parse(line).unwrap();
+    let r = json.member(j, "result").unwrap();
+    let content = json.get_array(r, "content").unwrap();
+    (json.get_string(content[0], "text").unwrap(), json.get_bool(r, "isError").unwrap_or(false))
+}
+
+@test
+fn the_protocol_offers_four_tools_and_two_resources() {
+    let p = server.build(ROOT);
+    let init = serve.handle(p, rpc(
+        1,
+        "initialize",
+        `{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}`
+    ))
+        .unwrap();
+    assert(init.contains("Search before adding"));
+    let list = json.parse(serve.handle(p, rpc(2, "tools/list", "{}")).unwrap()).unwrap();
+    let tools = json.get_array(json.member(list, "result").unwrap(), "tools").unwrap();
+    let names = tools.map(fn(t: json.Json) -> string { json.get_string(t, "name").unwrap() });
+    assert_eq(names, ["search_findings", "get_finding", "findings_summary", "add_finding"]);
+    let res = serve.handle(p, rpc(3, "resources/list", "{}")).unwrap();
+    assert(res.contains("findings://index"));
+    assert(res.contains("findings://convention"));
+    let idx = serve.handle(p, rpc(4, "resources/read", `{"uri":"findings://index"}`)).unwrap();
+    assert(idx.contains("Fixture index"));
+}
+
+@test
+fn tools_answer_and_fail_as_values() {
+    let p = server.build(ROOT);
+    let (found, err) = result_of(serve.handle(p, call_line(1, "search_findings", `{"query":"canal","status":"open"}`))
+        .unwrap());
+    assert(!err);
+    assert(found.starts_with("1 match:\n#3 [B] abierto · rayalpha"));
+    let (one, _) = result_of(serve.handle(p, call_line(2, "get_finding", `{"number":5}`)).unwrap());
+    assert(one.starts_with("open/rayalpha-1.27.60.md, abierto\n\n### 5. [E/D]"));
+    let (missing, failed) = result_of(serve.handle(p, call_line(3, "get_finding", `{"number":99}`))
+        .unwrap());
+    assert(failed);
+    assert_eq(missing, "there is no finding #99");
+    let (no_arg, failed2) = result_of(serve.handle(p, call_line(4, "get_finding", "{}")).unwrap());
+    assert(failed2);
+    assert(no_arg.contains("required"));
+    let (nothing, _) = result_of(serve.handle(p, call_line(5, "search_findings", `{"query":"zzzz"}`))
+        .unwrap());
+    assert_eq(nothing, "No findings match.");
+}
+
+@test
+fn add_finding_writes_and_refuses_duplicates() {
+    let tmp = fs.make_temp_dir("raymcp-test").unwrap();
+    fs.copy_all(ROOT, tmp).unwrap();
+    let p = server.build(tmp);
+    let args = `{"app":"raybeta","version":"1.27.65","type":"b","title":"Algo nuevo falla","body":"Repro: nada."}`;
+    let (ok, failed) = result_of(serve.handle(p, call_line(1, "add_finding", args)).unwrap());
+    assert(!failed);
+    assert(ok.starts_with("#6 added to findings/open/raybeta-1.27.65.md."));
+    // No tools/findings.py in the fixture: the index is left alone, and the answer says so.
+    assert(ok.contains("not regenerated"));
+    let (dup, failed2) = result_of(serve.handle(p, call_line(2, "add_finding", args)).unwrap());
+    assert(failed2);
+    assert(dup.contains("#6 already has this title"));
+    let (self_report, failed3) = result_of(serve.handle(p, call_line(
+        3,
+        "add_finding",
+        `{"app":"raybeta","version":"1.27.65","type":"B","title":"x","body":"y","affects":"raybeta"}`
+    ))
+        .unwrap());
+    assert(failed3);
+    assert(self_report.contains("itself"));
+    fs.remove_all(tmp);
+}
+
+@test
+fn a_client_talks_to_the_server_process() {
+    // The real thing: this program, `serve`, launched as a child and spoken to over stdio.
+    let c = ask.connect(ask.default_server(ROOT)).unwrap();
+    let tools = mcp.tools(c).unwrap();
+    assert_eq(tools.len(), 4);
+    assert(tools[0].read_only);
+    assert(!tools[3].read_only);
+    let out = mcp.call_json(c, "findings_summary", "{}").unwrap();
+    assert(out.starts_with("5 findings"));
+    assert(mcp.call_json(c, "get_finding", `{"number":42}`).is_err());
+    assert(mcp.call_json(c, "no_such_tool", "{}").is_err());
+    assert(mcp.read_resource(c, "findings://convention").unwrap().contains("Fixture findings"));
+    mcp.close(c);
+}

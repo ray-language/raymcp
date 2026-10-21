@@ -1,0 +1,379 @@
+//! The findings of ray-apps as data: `findings/open/*.md` and `findings/closed/*/*.md`, one
+//! campaign per file, one entry per `### N. [T] Title` heading. Reading is pure raylang; adding
+//! an entry writes the campaign file the same way `tools/findings.py new` does.
+
+import std/fs;
+import std/time;
+
+pub struct Entry {
+    number: int,
+    /// ✅ ⚠️ ❌ ➖, or "" while open.
+    mark: string,
+    kind: string,
+    title: string,
+    app: string,
+    versions: string,
+    affects: string,
+    issue: string,
+    /// Relative to the findings directory: `open/rayffi-1.27.65.md`.
+    file: string,
+    /// In a file under `open/` and without a mark.
+    open: bool,
+    /// The whole entry, heading included.
+    text: string,
+}
+
+pub const MARKS: [string] = ["✅", "⚠️", "❌", "➖"];
+
+pub struct Heading {
+    number: int,
+    mark: string,
+    kind: string,
+    title: string,
+}
+
+/// `### 209. ✅ [B] Title` → 209, "✅", "B", "Title". A struct, not a 4-tuple: an `Option` of a
+/// 4-tuple does not compile to native (finding #218).
+pub fn parse_heading(line: string) -> Option<Heading> {
+    let rest = line.strip_prefix("### ")?;
+    let dot = rest.index_of(". ")?;
+    let n = parse_int(rest.substring(0, dot))?;
+    var tail = rest.substring(dot + 2, rest.len());
+    var mark = "";
+    for m in MARKS {
+        if (tail.starts_with(m + " ")) {
+            mark = m;
+            tail = tail.substring(m.len() + 1, tail.len());
+        }
+    }
+    if (!tail.starts_with("[")) {
+        return Option.None;
+    }
+    let close = tail.index_of("] ")?;
+    let kind = tail.substring(1, close);
+    Option.Some(
+        Heading {
+            number: n,
+            mark: mark,
+            kind: kind,
+            title: tail.substring(close + 2, tail.len()).trim()
+        }
+    )
+}
+
+fn field(lines: [string], name: string) -> string {
+    let prefix = "**${name}:** ";
+    for l in lines {
+        match (l.strip_prefix(prefix)) {
+            Option.Some(v) => return v.trim(),
+            Option.None => { },
+        }
+    }
+    ""
+}
+
+/// `rayffi (raylang 1.27.65, net 0.10.1)` → ("rayffi", "raylang 1.27.65, net 0.10.1").
+fn split_app(s: string) -> (string, string) {
+    match (s.index_of(" (")) {
+        Option.Some(i) => {
+            let inner = s.substring(i + 2, s.len());
+            (s.substring(0, i), inner.strip_suffix(")").unwrap_or(inner))
+        },
+        Option.None => (s, ""),
+    }
+}
+
+/// Every entry of one campaign file.
+pub fn parse_file(file: string, content: string, in_open: bool) -> [Entry] {
+    var out: [Entry] = [];
+    let lines = content.split("\n");
+    var i = 0;
+    while (i < lines.len()) {
+        match (parse_heading(lines[i])) {
+            Option.Some(h) => {
+                var j = i + 1;
+                while (j < lines.len()
+                    && parse_heading(lines[j]).is_none()
+                    && !lines[j].starts_with("## ")) {
+                    j = j + 1;
+                }
+                let block = lines.slice(i, j);
+                let (app, versions) = split_app(field(block, "App"));
+                let affects = field(block, "Afecta a");
+                out.push(
+                    Entry {
+                        number: h.number,
+                        mark: h.mark,
+                        kind: h.kind,
+                        title: h.title,
+                        app: app,
+                        versions: versions,
+                        affects: if (affects == "") { "raylang" } else { affects },
+                        issue: field(block, "Issue"),
+                        file: file,
+                        open: in_open && h.mark == "",
+                        text: block.join("\n").trim()
+                    }
+                );
+                i = j;
+            },
+            Option.None => i = i + 1,
+        }
+    }
+    out
+}
+
+fn md_files(dir: string) -> [string] {
+    fs.list_dir(dir).unwrap_or([]).filter(fn(n: string) -> bool { n.ends_with(".md") })
+}
+
+/// Loads every entry under `dir` (the `findings/` directory), sorted by number.
+pub fn load(dir: string) -> Result<[Entry], string> {
+    if (!fs.is_dir("${dir}/open")) {
+        return Result.Err("${dir}: not a findings directory (no open/ inside)");
+    }
+    var all: [Entry] = [];
+    for name in md_files("${dir}/open") {
+        let text = fs.read_file("${dir}/open/${name}")?;
+        all = all + parse_file("open/${name}", text, true);
+    }
+    for month in fs.list_dir("${dir}/closed").unwrap_or([]) {
+        if (fs.is_dir("${dir}/closed/${month}")) {
+            for name in md_files("${dir}/closed/${month}") {
+                let text = fs.read_file("${dir}/closed/${month}/${name}")?;
+                all = all + parse_file("closed/${month}/${name}", text, false);
+            }
+        }
+    }
+    Result.Ok(sort_by(all, fn(a: Entry, b: Entry) -> bool { a.number < b.number }))
+}
+
+pub fn status(e: Entry) -> string {
+    if (e.open) { "abierto" } else {
+        if (e.mark == "") { "cerrado" } else { e.mark }
+    }
+}
+
+pub struct Query {
+    words: [string],
+    kind: string,
+    app: string,
+    affects: string,
+    /// "open", "closed" or "" for both.
+    state: string,
+    limit: int,
+}
+
+pub fn query(text: string) -> Query {
+    Query {
+        words: text.to_lower().split(" ").filter(fn(w: string) -> bool { w != "" }),
+        kind: "",
+        app: "",
+        affects: "",
+        state: "",
+        limit: 20
+    }
+}
+
+pub fn matches(e: Entry, q: Query) -> bool {
+    if (q.kind != "" && !e.kind.split("/").contains(q.kind.to_upper())) {
+        return false;
+    }
+    if (q.app != "" && e.app != q.app) {
+        return false;
+    }
+    if (q.affects != "" && e.affects != q.affects) {
+        return false;
+    }
+    if (q.state == "open" && !e.open) {
+        return false;
+    }
+    if (q.state == "closed" && e.open) {
+        return false;
+    }
+    let hay = e.text.to_lower();
+    for w in q.words {
+        if (!hay.contains(w)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Matches, newest first, at most `q.limit`; and how many there were in all.
+pub fn search(entries: [Entry], q: Query) -> ([Entry], int) {
+    let hits = entries.filter(fn(e: Entry) -> bool { matches(e, q) });
+    var out: [Entry] = [];
+    var i = hits.len() - 1;
+    while (i >= 0 && out.len() < q.limit) {
+        out.push(hits[i]);
+        i = i - 1;
+    }
+    (out, hits.len())
+}
+
+pub fn find(entries: [Entry], n: int) -> Option<Entry> {
+    for e in entries {
+        if (e.number == n) {
+            return Option.Some(e);
+        }
+    }
+    Option.None
+}
+
+pub fn line(e: Entry) -> string {
+    "#${e.number} [${e.kind}] ${status(e)} · ${e.app} (${e.versions}) · afecta a ${e.affects} — ${e.title} (${e.file})"
+}
+
+fn bump(m: Map<string, int>, k: string) {
+    m.insert(k, m.get_or(k, 0) + 1);
+}
+
+fn counts(m: Map<string, int>) -> string {
+    let keys = sort(m.keys());
+    keys.map(fn(k: string) -> string { "${k} ${m.get_or(k, 0)}" }).join(", ")
+}
+
+/// Totals, and the open ones by type, by component and by app.
+pub fn summary(entries: [Entry]) -> string {
+    let open = entries.filter(fn(e: Entry) -> bool { e.open });
+    let kinds: Map<string, int> = Map.new();
+    let affects: Map<string, int> = Map.new();
+    let apps: Map<string, int> = Map.new();
+    for e in open {
+        bump(kinds, e.kind);
+        bump(affects, e.affects);
+        bump(apps, e.app);
+    }
+    var last = 0;
+    for e in entries {
+        if (e.number > last) {
+            last = e.number;
+        }
+    }
+    "${entries.len()} findings (#1–#${last}), ${open.len()} open.\nOpen by type: ${counts(kinds)}\nOpen by component: ${counts(affects)}\nOpen by app: ${counts(apps)}"
+}
+
+// ---- adding ----
+
+pub struct NewEntry {
+    app: string,
+    version: string,
+    versions: string,
+    kind: string,
+    title: string,
+    affects: string,
+    body: string,
+    /// The "Cómo se midió" line of a new campaign file ("" = the placeholder).
+    measured: string,
+}
+
+pub const COMPONENTS: [string] = ["raylang", "net", "web", "rpc", "db", "ray-elements"];
+
+fn valid_kind(k: string) -> bool {
+    if (k == "") {
+        return false;
+    }
+    for part in k.split("/") {
+        if (!["B", "D", "E"].contains(part)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_version(v: string) -> bool {
+    let parts = v.split(".");
+    parts.len() == 3 && parts.filter(fn(p: string) -> bool { parse_int(p).is_some() }).len() == 3
+}
+
+fn valid_name(s: string) -> bool {
+    if (s == "") {
+        return false;
+    }
+    for c in s.chars() {
+        let ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        if (!ok) {
+            return false;
+        }
+    }
+    true
+}
+
+/// What is wrong with `n`, or "" if nothing. Same rules as tools/findings.py: the finder is not
+/// the owner, and the owner is a known component or an app.
+pub fn check(n: NewEntry, apps: [string]) -> string {
+    if (!valid_name(n.app)) {
+        return "app must be a ray-apps name in lowercase (rayffi, raystat…), got '${n.app}'";
+    }
+    if (!valid_version(n.version)) {
+        return "version must be X.Y.Z, got '${n.version}'";
+    }
+    if (!valid_kind(n.kind)) {
+        return "type must be B, D, E or a combination like D/E, got '${n.kind}'";
+    }
+    if (n.title.trim() == "" || n.title.contains("\n")) {
+        return "title must be one non-empty line";
+    }
+    if (n.body.trim() == "") {
+        return "body is empty: say what was done, what was expected, what happened";
+    }
+    let target = if (n.affects == "") { "raylang" } else { n.affects };
+    if (target == n.app) {
+        return "'${n.app}' does not file findings about itself here: that goes to the app's issues";
+    }
+    if (!COMPONENTS.contains(target) && !apps.contains(target)) {
+        return "affects '${target}' is neither a component (${COMPONENTS.join(", ")}) nor an app";
+    }
+    ""
+}
+
+const MONTHS: [string] = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec"
+];
+
+fn today() -> string {
+    let d = time.now_utc();
+    "${d.day} ${MONTHS[d.month - 1]} ${d.year}"
+}
+
+/// Appends `n` to its campaign file under `dir`, creating the file if needed, with the next
+/// global number. Returns (number, file relative to `dir`).
+pub fn add(dir: string, entries: [Entry], n: NewEntry) -> Result<(int, string), string> {
+    var last = 0;
+    for e in entries {
+        if (e.number > last) {
+            last = e.number;
+        }
+    }
+    let number = last + 1;
+    let rel = "open/${n.app}-${n.version}.md";
+    let path = "${dir}/${rel}";
+    if (!fs.exists(path)) {
+        let measured = if (n.measured == "") {
+            "<release del binario, máquina, motor (VM/nativo/intérprete), SO>."
+        } else {
+            n.measured
+        };
+        fs.write_file(
+            path,
+            "# ${n.app}: revisión con raylang ${n.version} (${today()})\n\nCómo se midió: ${measured}\n\n| # | estado | evidencia |\n|---:|---|---|\n\n"
+        )?;
+    }
+    let versions = "raylang ${n.version}" + if (n.versions == "") { "" } else { ", ${n.versions}" };
+    let target = if (n.affects == "") { "raylang" } else { n.affects };
+    let entry = "\n### ${number}. [${n.kind}] ${n.title.trim()}\n**App:** ${n.app} (${versions})\n**Afecta a:** ${target}\n\n${n.body.trim()}\n";
+    fs.append_file(path, entry)?;
+    Result.Ok((number, rel))
+}

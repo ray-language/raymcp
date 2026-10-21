@@ -1,0 +1,135 @@
+import std/fs;
+import findings;
+
+const DIR: string = "tests/fixtures/apps/findings";
+
+fn heading(line: string) -> string {
+    match (findings.parse_heading(line)) {
+        Option.Some(h) => "${h.number}|${h.mark}|${h.kind}|${h.title}",
+        Option.None => "none",
+    }
+}
+
+@test
+fn headings_parse_with_and_without_marks() {
+    assert_eq(heading("### 209. [B] Title here"), "209||B|Title here");
+    assert_eq(heading("### 4. ✅ [D] llms.txt"), "4|✅|D|llms.txt");
+    assert_eq(heading("### 7. ⚠️ [D/E] Both"), "7|⚠️|D/E|Both");
+    assert_eq(heading("### Not an entry"), "none");
+    assert_eq(heading("## 3. [B] a section"), "none");
+}
+
+@test
+fn loads_open_and_closed_campaigns() {
+    let es = findings.load(DIR).unwrap();
+    assert_eq(es.map(fn(e: findings.Entry) -> int { e.number }), [1, 2, 3, 4, 5]);
+    let three = findings.find(es, 3).unwrap();
+    assert_eq(three.app, "rayalpha");
+    assert_eq(three.versions, "raylang 1.27.60, net 0.10.1");
+    assert_eq(three.affects, "raylang");
+    assert(three.open);
+    assert_eq(three.file, "open/rayalpha-1.27.60.md");
+    assert(three.text.ends_with("al cerrarse."));
+    // A mark closes it even in open/; no "Afecta a" means raylang.
+    let four = findings.find(es, 4).unwrap();
+    assert(!four.open);
+    assert_eq(findings.status(four), "✅");
+    assert_eq(four.affects, "raylang");
+    let five = findings.find(es, 5).unwrap();
+    assert_eq(five.affects, "ray-elements");
+    assert_eq(five.issue, "ray-elements#12");
+    assert_eq(findings.find(es, 2).unwrap().file, "closed/2026-09/raybeta-1.27.50.md");
+    assert(findings.load("tests").is_err());
+}
+
+@test
+fn search_filters_and_orders_newest_first() {
+    let es = findings.load(DIR).unwrap();
+    let (all, n) = findings.search(es, findings.query(""));
+    assert_eq(n, 5);
+    assert_eq(all[0].number, 5);
+    var q = findings.query("CANAL nativo");
+    let (hits, _) = findings.search(es, q);
+    assert_eq(hits.map(fn(e: findings.Entry) -> int { e.number }), [3]);
+    q = findings.query("");
+    q.state = "open";
+    assert_eq(findings.search(es, q).1, 2);
+    q.kind = "D";
+    // E/D counts as D.
+    assert_eq(findings.search(es, q).0[0].number, 5);
+    q = findings.query("");
+    q.affects = "ray-elements";
+    assert_eq(findings.search(es, q).1, 1);
+    q = findings.query("");
+    q.limit = 2;
+    let (two, total) = findings.search(es, q);
+    assert_eq(two.len(), 2);
+    assert_eq(total, 5);
+}
+
+@test
+fn summary_counts_the_open_ones() {
+    let s = findings.summary(findings.load(DIR).unwrap());
+    assert(s.starts_with("5 findings (#1–#5), 2 open."));
+    assert(s.contains("Open by type: B 1, E/D 1"));
+    assert(s.contains("Open by component: ray-elements 1, raylang 1"));
+}
+
+fn entry(app: string, kind: string, affects: string) -> findings.NewEntry {
+    findings.NewEntry {
+        app: app,
+        version: "1.27.65",
+        versions: "",
+        kind: kind,
+        title: "Un título",
+        affects: affects,
+        body: "Qué pasó.",
+        measured: ""
+    }
+}
+
+@test
+fn new_entries_are_checked() {
+    let apps = ["rayalpha", "raybeta"];
+    assert_eq(findings.check(entry("rayalpha", "B", ""), apps), "");
+    assert_eq(findings.check(entry("rayalpha", "D/E", "net"), apps), "");
+    assert_eq(findings.check(entry("rayalpha", "B", "raybeta"), apps), "");
+    assert(findings.check(entry("rayalpha", "B", "rayalpha"), apps).contains("itself"));
+    assert(findings.check(entry("rayalpha", "X", ""), apps).contains("type"));
+    assert(findings.check(entry("rayalpha", "B", "nobody"), apps).contains("neither"));
+    assert(findings.check(entry("Ray Alpha", "B", ""), apps).contains("lowercase"));
+    var bad = entry("rayalpha", "B", "");
+    bad.version = "1.27";
+    assert(findings.check(bad, apps).contains("X.Y.Z"));
+    bad = entry("rayalpha", "B", "");
+    bad.body = "  ";
+    assert(findings.check(bad, apps).contains("empty"));
+}
+
+@test
+fn adding_takes_the_next_number_and_creates_the_campaign() {
+    let tmp = fs.make_temp_dir("raymcp-test").unwrap();
+    fs.copy_all(DIR, "${tmp}/findings").unwrap();
+    let dir = "${tmp}/findings";
+    var n = entry("raybeta", "B", "");
+    n.measured = "a fixture.";
+    let (number, rel) = findings.add(dir, findings.load(dir).unwrap(), n).unwrap();
+    assert_eq(number, 6);
+    assert_eq(rel, "open/raybeta-1.27.65.md");
+    let text = fs.read_file("${dir}/${rel}").unwrap();
+    assert(text.starts_with("# raybeta: revisión con raylang 1.27.65 ("));
+    assert(text.contains("Cómo se midió: a fixture."));
+    assert(
+        text.contains(
+            "### 6. [B] Un título\n**App:** raybeta (raylang 1.27.65)\n**Afecta a:** raylang\n\nQué pasó.\n"
+        )
+    );
+    // A second one appends to the same file, and the parser sees both.
+    let (seven, _) = findings.add(dir, findings.load(dir).unwrap(), entry("raybeta", "E", ""))
+        .unwrap();
+    assert_eq(seven, 7);
+    let again = findings.load(dir).unwrap();
+    assert_eq(findings.find(again, 7).unwrap().file, rel);
+    assert(findings.find(again, 6).unwrap().open);
+    fs.remove_all(tmp);
+}

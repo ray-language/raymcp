@@ -1,0 +1,5 @@
+[
+  {"text": "Let me look.", "tools": [{"name": "mcp__raymcp__search_findings", "arguments": {"query": "ptr", "status": "open"}}]},
+  {"tools": [{"name": "mcp__raymcp__get_finding", "arguments": {"number": 214}}]},
+  {"text": "Finding #214 (rayffi, open): in a native binary a struct holding a ptr compiles when sent over a channel but panics at runtime, even with spawn_local."}
+]
