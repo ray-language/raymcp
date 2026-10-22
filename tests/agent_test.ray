@@ -22,17 +22,6 @@ fn options(url: string, root: string) -> ask.Options {
     }
 }
 
-/// The scripted model is an HTTP server, and on Windows a pending accept starves the rest: natively
-/// it holds a worker's thread, and on the VM the MCP child's replies never arrive while it waits
-/// (finding #222). The agent tests would hang or time out there.
-fn no_http_server() -> bool {
-    let skip = platform() == "windows";
-    if (skip) {
-        eprint("skipped on Windows: a pending accept starves the MCP session (#222)");
-    }
-    skip
-}
-
 fn never() -> Channel<int> {
     let c: Channel<int> = Channel.bounded(1);
     c
@@ -45,9 +34,6 @@ const SEARCH_THEN_ANSWER: string = `[
 
 @test
 fn a_turn_goes_model_tool_model() {
-    if (no_http_server()) {
-        return;
-    }
     let m = fakemodel.start(SEARCH_THEN_ANSWER, 0).unwrap();
     let s = ask.open(options(fakemodel.url(m), ROOT)).unwrap();
     assert_eq(s.tools, 4);
@@ -75,9 +61,6 @@ const ADD: string = `[
 
 @test
 fn writing_needs_a_yes() {
-    if (no_http_server()) {
-        return;
-    }
     let tmp = fs.make_temp_dir("raymcp-test").unwrap();
     fs.copy_all(ROOT, tmp).unwrap();
     // Nobody to ask (--no): the call is declined, the model is told, nothing is written.
@@ -107,10 +90,24 @@ fn writing_needs_a_yes() {
 }
 
 @test
+fn autonomy_edits_files_without_asking() {
+    // add_finding is a write_tool (reversible): EDITS runs it, with nobody to say yes.
+    let tmp = fs.make_temp_dir("raymcp-test").unwrap();
+    fs.copy_all(ROOT, tmp).unwrap();
+    let m = fakemodel.start(ADD, 0).unwrap();
+    var o = options(fakemodel.url(m), tmp);
+    o.autonomy = agent.EDITS;
+    o.approve = "no";
+    let s = ask.open(o).unwrap();
+    ask.turn(s, "file it", never()).unwrap();
+    assert(fs.exists("${tmp}/findings/open/raybeta-1.27.65.md"));
+    ask.close(s);
+    fakemodel.stop(m);
+    fs.remove_all(tmp);
+}
+
+@test
 fn autonomy_auto_runs_without_asking() {
-    if (no_http_server()) {
-        return;
-    }
     let tmp = fs.make_temp_dir("raymcp-test").unwrap();
     fs.copy_all(ROOT, tmp).unwrap();
     let m = fakemodel.start(ADD, 0).unwrap();
@@ -127,9 +124,6 @@ fn autonomy_auto_runs_without_asking() {
 
 @test
 fn streaming_gives_the_same_answer() {
-    if (no_http_server()) {
-        return;
-    }
     let m = fakemodel.start(SEARCH_THEN_ANSWER, 0).unwrap();
     var o = options(fakemodel.url(m), ROOT);
     o.stream = true;
@@ -144,9 +138,6 @@ fn streaming_gives_the_same_answer() {
 
 @test
 fn errors_worth_retrying_are_retried() {
-    if (no_http_server()) {
-        return;
-    }
     let m = fakemodel.start(`[{"status":500},{"status":429,"retry_after":1},{"text":"Third time."}]`, 0)
         .unwrap();
     let s = ask.open(options(fakemodel.url(m), ROOT)).unwrap();
@@ -167,9 +158,6 @@ fn errors_worth_retrying_are_retried() {
 
 @test
 fn a_slow_turn_can_be_cancelled() {
-    if (no_http_server()) {
-        return;
-    }
     let m = fakemodel.start(`[{"delay_ms":3000,"text":"too late"}]`, 0).unwrap();
     let s = ask.open(options(fakemodel.url(m), ROOT)).unwrap();
     let cancel: Channel<int> = Channel.bounded(1);
@@ -187,9 +175,6 @@ fn a_slow_turn_can_be_cancelled() {
 
 @test
 fn the_step_budget_stops_a_loop() {
-    if (no_http_server()) {
-        return;
-    }
     // A model that only ever calls tools.
     var steps: [string] = [];
     for i in 0..5 {

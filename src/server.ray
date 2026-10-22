@@ -144,7 +144,7 @@ pub fn build(root: string) -> Provider {
     serve.read_only_tool(p, "search_findings", "Searches the findings by words and filters. Returns one line per finding, newest first: number, type, status, app, versions, who must fix it, title and file.", SEARCH_SCHEMA, fn(args: Json) -> Result<string, string> { search(root, args) });
     serve.read_only_tool(p, "get_finding", "The full text of one finding by its number, with its file and status.", GET_SCHEMA, fn(args: Json) -> Result<string, string> { get(root, args) });
     serve.read_only_tool(p, "findings_summary", "How many findings there are, and the open ones by type, by component and by app.", "", fn(args: Json) -> Result<string, string> { summary(root) });
-    serve.tool(p, "add_finding", "Files a new finding with the next global number, in the campaign file of its app and raylang version, and regenerates the index. Search first: a duplicate title is refused.", ADD_SCHEMA, fn(args: Json) -> Result<string, string> { add(root, args) });
+    serve.write_tool(p, "add_finding", "Files a new finding with the next global number, in the campaign file of its app and raylang version, and regenerates the index. Search first: a duplicate title is refused.", ADD_SCHEMA, fn(args: Json) -> Result<string, string> { add(root, args) });
     serve.resource(p, "findings://index", "Findings index", "INDEX.md: every finding in a table, the open ones first", "text/markdown", fn() -> Result<string, string> { read_file("${root}/findings/INDEX.md") });
     serve.resource(p, "findings://convention", "Findings convention", "README.md of findings/: what is filed, types, format of an entry", "text/markdown", fn() -> Result<string, string> { read_file("${root}/findings/README.md") });
     p

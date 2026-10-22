@@ -1,11 +1,10 @@
 [package]
 name = "raymcp"
 version = "0.1.0"
-raylang = "1.27.65"
+raylang = "1.27.73"
 license = "Apache-2.0"
 
 [dependencies]
-mcp = "^0.2.0"
-llm = "^0.2.0"
-agent = "^0.2.0"
-net = "^0.10.1"
+mcp = "^0.2.1"
+llm = "^0.2.1"
+agent = "^0.2.1"

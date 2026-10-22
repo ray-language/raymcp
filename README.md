@@ -73,8 +73,8 @@ otro: lanza `raymcp serve` como proceso hijo y habla MCP por stdio.
 | `--stream` | el texto según llega |
 | `--steps N` | llamadas al modelo por turno (20) |
 
-`add_finding` no es de solo lectura, así que en `ask` y en `edits` pregunta antes de escribir
-(#220). Ctrl-C cancela el turno en curso; dos seguidos salen.
+`add_finding` escribe, pero se puede deshacer (`serve.write_tool`, que el agente trata como
+`WRITE`): en `ask` pregunta antes de escribir, y en `edits` y `auto` no. Ctrl-C cancela el turno en curso; dos seguidos salen.
 
 ### El modelo con guion
 
@@ -125,7 +125,7 @@ cerrarse su entrada.
 
 ```bash
 make build         # ./raymcp, binario nativo
-make test          # 17 tests en la VM
+make test          # 18 tests en la VM
 make test-native   # los mismos, compilados
 make tools         # lo que ofrece el servidor sobre los hallazgos reales, por MCP
 make demo          # un turno del agente con el modelo con guion
@@ -135,10 +135,10 @@ make demo          # un turno del agente con el modelo con guion
 
 | Qué | Estado |
 |---|---|
-| Hallazgos, servidor, cliente, agente | **17 tests** en VM y nativo (raylang 1.27.65; agent, llm y mcp 0.2.0; net 0.10.1) |
-| De punta a punta | modelo con guion → agente → cliente MCP → `raymcp serve` en otro proceso → archivos: búsqueda, aprobación sí y no, `auto`, streaming, reintentos (500, 429), cancelación y el límite de pasos |
+| Hallazgos, servidor, cliente, agente | **18 tests** en VM y nativo (raylang 1.27.73; agent, llm y mcp 0.2.1; net 0.10.1) |
+| De punta a punta | modelo con guion → agente → cliente MCP → `raymcp serve` en otro proceso → archivos: búsqueda, aprobación sí y no, `edits` y `auto`, streaming, reintentos (500, 429), cancelación y el límite de pasos |
 | Sobre los hallazgos reales | `tools`, `call` y `ask --fake` sobre los 221 hallazgos; el resumen coincide con `INDEX.md` |
-| Windows | el servidor y el cliente MCP, en CI. Los tests del agente se saltan: el modelo con guion es un servidor HTTP, y en Windows un `accept` pendiente bloquea el hilo de su worker en nativo y deja sin respuesta la sesión MCP con el hijo en la VM (#222) |
+| Windows | en CI, con los tests del agente. Hasta raylang 1.27.73 se saltaban: un `accept` pendiente (el modelo con guion es un servidor HTTP) dejaba sin respuesta la sesión MCP con el hijo (#222) |
 | Un modelo de verdad | **sin probar**: en esta máquina no hay clave de Anthropic ni modelo local |
 | Claude Code como cliente | sin probar (el comando para registrarlo está arriba) |
 
@@ -147,18 +147,20 @@ herramienta para cerrar hallazgos (poner la marca ✅ al volver a medir).
 
 ## Hallazgos de dogfood
 
-En `findings/open/raymcp-1.27.65.md` del directorio de las apps:
+En `findings/` del directorio de las apps (`closed/2026-10/raymcp-1.27.65.md`, y la re-medición
+en `open/raymcp-1.27.73.md`). Los cinco quedaron arreglados en raylang 1.27.73 y los paquetes 0.2.1:
 
-1. **#217 [D]** Bajo `ray test --native`, `launch_mode()` dice `"native"` y `self_command()` da el
-   binario de test, así que el servidor se lanzaba mal. La doc dice `"test"`. raymcp mira
-   `RAY_TEST`.
-2. **#218 [B]** Un `Option` de una tupla de 4 elementos no compila en nativo, con errores de rustc
-   que `ray check` no anticipa. Con 2 y 3 elementos sí compila.
-3. **#219 [E]** `llm` y `mcp` 0.2.0 fijan `net` en v0.5.0 por git. Añadir `net ^0.10.1` lo sustituye
-   para todos, sin aviso.
-4. **#220 [E]** Por MCP no se puede declarar una herramienta que escribe sin destruir, y `agent` la
-   trata como `EXEC`: en `edits` también pregunta.
-5. **#221 [D]** `ray doc` muestra `-> Config` sin su módulo, y `llm/llm` no lo reexporta.
+1. **#217 [D]** ✅ Bajo `ray test --native`, `launch_mode()` decía `"native"` y `self_command()` daba
+   el binario de test, así que el servidor se lanzaba mal; la doc decía `"test"`. raymcp miraba
+   `RAY_TEST`; ahora mira `launch_mode()`.
+2. **#218 [B]** ✅ Un `Option` de una tupla de 4 elementos no compilaba en nativo, con errores de rustc
+   que `ray check` no anticipaba. raymcp usa un struct (`Heading`), que se queda.
+3. **#219 [E]** ✅ `llm` y `mcp` 0.2.0 fijaban `net` en v0.5.0 por git, y añadir `net ^0.10.1` lo
+   sustituía para todos, sin aviso. Con 0.2.1 piden `net ^0.10.1` del índice y raymcp ya no lo
+   declara.
+4. **#220 [E]** ✅ Por MCP no se podía declarar una herramienta que escribe sin destruir, y `agent` la
+   trataba como `EXEC`: en `edits` también preguntaba. Ahora `add_finding` es un `write_tool`.
+5. **#221 [D]** ✅ `ray doc` mostraba `-> Config` sin su módulo, y `llm/llm` no lo reexportaba.
 
 Lo que salió bien:
 

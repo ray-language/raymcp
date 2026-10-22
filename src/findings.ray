@@ -32,8 +32,7 @@ pub struct Heading {
     title: string,
 }
 
-/// `### 209. ✅ [B] Title` → 209, "✅", "B", "Title". A struct, not a 4-tuple: an `Option` of a
-/// 4-tuple does not compile to native (finding #218).
+/// `### 209. ✅ [B] Title` → 209, "✅", "B", "Title".
 pub fn parse_heading(line: string) -> Option<Heading> {
     let rest = line.strip_prefix("### ")?;
     let dot = rest.index_of(". ")?;

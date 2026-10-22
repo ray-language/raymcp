@@ -9,7 +9,7 @@ import llm/llm;
 import mcp/mcp;
 from agent/agent import Decision, Event;
 from llm/message import ToolCall;
-from llm/config import Config;
+from llm/llm import Config;
 
 pub struct Options {
     root: string,
@@ -31,10 +31,9 @@ pub const SYSTEM: string = `You are raymcp, an assistant for the findings that t
 
 /// How to launch the findings server: this same program, `serve --root ROOT`.
 pub fn default_server(root: string) -> [string] {
-    // Under a test suite this program cannot serve: `ray test` reports `[ray, test]`, and
-    // `ray test --native` the test binary, with launch_mode() "native" (finding #217). The
-    // suite's environment carries RAY_TEST=1 in both, so the server runs from the source.
-    if (env("RAY_TEST").unwrap_or("") == "1") {
+    // Under a test suite this program cannot serve (`ray test` is `[ray, test]`, `ray test
+    // --native` the test binary with `test`), so the server runs from the source.
+    if (process.launch_mode() == "test") {
         return ["ray", "run", "src/main.ray", "serve", "--root", root];
     }
     process.self_command() + ["serve", "--root", root]

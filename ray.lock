@@ -3,21 +3,21 @@
 
 [agent]
 url = "https://github.com/ray-language/agent"
-ref = "v0.2.0"
-commit = "7469b1ff813757270417cf1a04d0e644f19b7aec"
-hash = "sha256:9ebe1e2b9aac2bc89cbaac7ac49e2e84256ce69ad1365afcf75c91a1a34760db"
+ref = "v0.2.1"
+commit = "d37e203816bf13ac92a7d7d98570e73da794f2be"
+hash = "sha256:396cb1b2ba49c0bc3a49d1b1cccbcf6ccfdb2b6842881e973f6a2a36718a31bb"
 
 [llm]
 url = "https://github.com/ray-language/llm"
-ref = "v0.2.0"
-commit = "b2d024e1288c5a6fbca4d5af3ea16a6e62301015"
-hash = "sha256:1bb664c2a05bc7d923234daf8bc891fb270b46d0a48617b0f9706eec5d0bcead"
+ref = "v0.2.1"
+commit = "36de23ca3fd6a949cab5dce45f10c20d4039194a"
+hash = "sha256:b76548098e2cdc2f6c47c5a93fdffa6b565c6cdee62f69ba11dc97f66b212640"
 
 [mcp]
 url = "https://github.com/ray-language/mcp"
-ref = "v0.2.0"
-commit = "ca49547238ac55e665c4703ebec5ed77bf407ff2"
-hash = "sha256:51d7d59709a46e2e03152719d13e94b5fce72d82e377efca5f83b87e7bc9857e"
+ref = "v0.2.1"
+commit = "f0dfdfb244ba33511e85be1859777714cb19ad87"
+hash = "sha256:8de2a0962907dcb997f78bfd1ee515d9724037ec064152d87c6a02fa9e86123b"
 
 [net]
 url = "https://github.com/ray-language/net"
