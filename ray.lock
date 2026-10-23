@@ -15,12 +15,12 @@ hash = "sha256:b76548098e2cdc2f6c47c5a93fdffa6b565c6cdee62f69ba11dc97f66b212640"
 
 [mcp]
 url = "https://github.com/ray-language/mcp"
-ref = "v0.2.1"
-commit = "f0dfdfb244ba33511e85be1859777714cb19ad87"
-hash = "sha256:8de2a0962907dcb997f78bfd1ee515d9724037ec064152d87c6a02fa9e86123b"
+ref = "v0.3.1"
+commit = "674adffc34745b90f15dc1f8bccb289d572fd9a4"
+hash = "sha256:bab959cd6a58baa6ba0950d679db07d0b01230c424099ef1a9623df27a110d79"
 
 [net]
 url = "https://github.com/ray-language/net"
-ref = "v0.10.1"
-commit = "20f18ebb97d28ebea3854722297f121826182eee"
-hash = "sha256:ee2ddf5e5427ef29a084f1055f665480e3e81f56efa86b65b09bfe47affd2ad7"
+ref = "v0.11.2"
+commit = "b1366349b8caa837a2d6b6b1aaa16717a8a23f5a"
+hash = "sha256:550f5d7e276b90ec77d6697e722eca782482febc9608885dec00b95fefcb304f"
