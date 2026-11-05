@@ -3,9 +3,9 @@
 
 import std/fs;
 import std/json;
-import std/process;
 import mcp/serve;
 import findings;
+import findings_cli;
 from std/json import Json;
 from mcp/serve import Provider;
 
@@ -84,25 +84,10 @@ pub fn summary(root: string) -> Result<string, string> {
     Result.Ok(findings.summary(entries))
 }
 
-fn apps(root: string) -> [string] {
-    fs.list_dir(root).unwrap_or([]).filter(fn(n: string) -> bool {
-        !n.starts_with(".") && n != "findings" && fs.is_dir("${root}/${n}")
-    })
-}
-
-/// Regenerates INDEX.md with the repo's own tool, if it is there.
+/// Regenerates INDEX.md, and says how that went.
 fn reindex(root: string) -> string {
-    if (!fs.exists("${root}/tools/findings.py")) {
-        return "INDEX.md not regenerated (no tools/findings.py here).";
-    }
-    match (process.cmd("python3", ["tools/findings.py", "index"])
-        .dir(root)
-        .timeout_ms(30000)
-        .run()) {
-        Result.Ok(out) => match (out.exit) {
-            process.Exit.Code(0) => from_utf8(out.stdout).unwrap_or("").trim(),
-            _ => "INDEX.md not regenerated: ${from_utf8(out.stderr).unwrap_or("").trim()}",
-        },
+    match (findings_cli.write_index(root)) {
+        Result.Ok(r) => r.summary,
         Result.Err(e) => "INDEX.md not regenerated: ${e}",
     }
 }
@@ -118,7 +103,7 @@ pub fn add(root: string, args: Json) -> Result<string, string> {
         body: text(args, "body"),
         measured: text(args, "measured")
     };
-    let problem = findings.check(n, apps(root));
+    let problem = findings.check(n, findings.apps(root));
     if (problem != "") {
         return Result.Err(problem);
     }
@@ -141,11 +126,49 @@ fn read_file(path: string) -> Result<string, string> {
 pub fn build(root: string) -> Provider {
     var p = serve.provider("raymcp", VERSION);
     p.instructions = INSTRUCTIONS;
-    serve.read_only_tool(p, "search_findings", "Searches the findings by words and filters. Returns one line per finding, newest first: number, type, status, app, versions, who must fix it, title and file.", SEARCH_SCHEMA, fn(args: Json) -> Result<string, string> { search(root, args) });
-    serve.read_only_tool(p, "get_finding", "The full text of one finding by its number, with its file and status.", GET_SCHEMA, fn(args: Json) -> Result<string, string> { get(root, args) });
-    serve.read_only_tool(p, "findings_summary", "How many findings there are, and the open ones by type, by component and by app.", "", fn(args: Json) -> Result<string, string> { summary(root) });
-    serve.write_tool(p, "add_finding", "Files a new finding with the next global number, in the campaign file of its app and raylang version, and regenerates the index. Search first: a duplicate title is refused.", ADD_SCHEMA, fn(args: Json) -> Result<string, string> { add(root, args) });
-    serve.resource(p, "findings://index", "Findings index", "INDEX.md: every finding in a table, the open ones first", "text/markdown", fn() -> Result<string, string> { read_file("${root}/findings/INDEX.md") });
-    serve.resource(p, "findings://convention", "Findings convention", "README.md of findings/: what is filed, types, format of an entry", "text/markdown", fn() -> Result<string, string> { read_file("${root}/findings/README.md") });
+    serve.read_only_tool(
+        p,
+        "search_findings",
+        "Searches the findings by words and filters. Returns one line per finding, newest first: number, type, status, app, versions, who must fix it, title and file.",
+        SEARCH_SCHEMA,
+        fn(args: Json) -> Result<string, string> { search(root, args) }
+    );
+    serve.read_only_tool(
+        p,
+        "get_finding",
+        "The full text of one finding by its number, with its file and status.",
+        GET_SCHEMA,
+        fn(args: Json) -> Result<string, string> { get(root, args) }
+    );
+    serve.read_only_tool(
+        p,
+        "findings_summary",
+        "How many findings there are, and the open ones by type, by component and by app.",
+        "",
+        fn(args: Json) -> Result<string, string> { summary(root) }
+    );
+    serve.write_tool(
+        p,
+        "add_finding",
+        "Files a new finding with the next global number, in the campaign file of its app and raylang version, and regenerates the index. Search first: a duplicate title is refused.",
+        ADD_SCHEMA,
+        fn(args: Json) -> Result<string, string> { add(root, args) }
+    );
+    serve.resource(
+        p,
+        "findings://index",
+        "Findings index",
+        "INDEX.md: every finding in a table, the open ones first",
+        "text/markdown",
+        fn() -> Result<string, string> { read_file("${root}/findings/INDEX.md") }
+    );
+    serve.resource(
+        p,
+        "findings://convention",
+        "Findings convention",
+        "README.md of findings/: what is filed, types, format of an entry",
+        "text/markdown",
+        fn() -> Result<string, string> { read_file("${root}/findings/README.md") }
+    );
     p
 }

@@ -1,0 +1,792 @@
+//! `raymcp findings …`: what a person (or a script) does with the findings. Every command returns
+//! its output as a value, so a test can read it without a process. What the tool says is English;
+//! what it writes in the campaign files and in INDEX.md is Spanish, like the rest of that data.
+
+import std/fs;
+import std/time;
+import findings;
+
+pub const USAGE: string = `raymcp findings — manage the findings of ray-apps
+
+usage:
+  raymcp findings new --app A --version V --type T --title "..." [--affects X] [--versions "..."]
+                                  files a new finding with the next global number
+  raymcp findings mark N MARK --app A --version V --evidence "..." [--how "..."]
+                                  records a re-measurement (MARK: ✅ ⚠️ ❌ ➖): header + campaign row
+  raymcp findings history N       the measurements of a finding, oldest first
+  raymcp findings open [--type B] [--affects X] [--app Y]
+                                  what is still open
+  raymcp findings check           malformed, misclassified or inconsistent findings (exit 1 if any)
+  raymcp findings index           regenerates findings/INDEX.md
+  raymcp findings archive [--dry-run]
+                                  moves to closed/ the campaigns whose cited findings are all closed
+`;
+
+pub struct Output {
+    code: int,
+    out: [string],
+    err: [string],
+}
+
+pub struct IndexResult {
+    /// The one-line summary of what was written.
+    summary: string,
+    /// Problems of the open findings, one per line.
+    warnings: [string],
+}
+
+/// Components a title can wrongly name instead of using `**Afecta a:**`.
+const TITLE_COMPONENTS: [string] = ["ray-elements", "net", "web", "rpc", "db", "mcp", "oidc"];
+
+const TABLE_HEAD: [string] = [
+    "| # | tipo | estado | afecta a | app | raylang | título | issue | archivo |",
+    "|---:|---|---|---|---|---|---|---|---|"
+];
+
+fn dir_of(root: string) -> string {
+    "${root}/findings"
+}
+
+fn pad2(n: int) -> string {
+    if (n < 10) { "0${n}" } else { "${n}" }
+}
+
+fn pad_left(s: string, width: int) -> string {
+    " ".repeat(if (s.len() < width) { width - s.len() } else { 0 }) + s
+}
+
+fn pad_right(s: string, width: int) -> string {
+    s + " ".repeat(if (s.len() < width) { width - s.len() } else { 0 })
+}
+
+fn or_dash(s: string) -> string {
+    if (s == "") { "—" } else { s }
+}
+
+fn known_targets(root: string) -> [string] {
+    findings.COMPONENTS + findings.apps(root)
+}
+
+// ---- what is wrong with an entry or a campaign ----
+
+fn title_component(title: string) -> string {
+    let lower = title.to_lower();
+    for name in TITLE_COMPONENTS {
+        match (lower.strip_prefix(name)) {
+            Option.Some(rest) => {
+                if (rest.trim().starts_with(":")) {
+                    return title.substring(0, name.len());
+                }
+            },
+            Option.None => { },
+        }
+    }
+    ""
+}
+
+/// Problems of form: a component in the title without `Afecta a`, an app affecting itself…
+fn problems(e: findings.Entry, targets: [string]) -> [string] {
+    var out: [string] = [];
+    let named = title_component(e.title);
+    if (named != "" && !e.affects_explicit) {
+        out.push(
+            "the title starts with «${named}:» but there is no `**Afecta a:**` line (does it affect ${named}?)"
+        );
+    }
+    if (e.app != "" && e.affects == e.app) {
+        out.push("affects the app that found it: that goes to the app's issues, not here");
+    }
+    if (e.affects_explicit && !targets.contains(e.affects)) {
+        out.push("`Afecta a: ${e.affects}` is neither a component nor a known app");
+    }
+    if (e.app_line == "") {
+        out.push("missing `**App:**` line");
+    }
+    out
+}
+
+fn by_number(entries: [findings.Entry]) -> Map<int, findings.Entry> {
+    let out: Map<int, findings.Entry> = Map.new();
+    for e in entries {
+        out.insert(e.number, e);
+    }
+    out
+}
+
+struct CampaignState {
+    cited: [int],
+    still_open: [int],
+    unknown: [int],
+    unparsed: [(int, string)],
+}
+
+/// A campaign's state comes from the headers of what it cites, wherever those findings live. A ❌
+/// row whose finding a later release fixed is history, not state: the header decides.
+fn campaign_state(c: findings.Campaign, entries: Map<int, findings.Entry>) -> CampaignState {
+    var numbers: [int] = c.entries.map(fn(e: findings.Entry) -> int { e.number }) + c.rows.map(fn(r: findings.Row) -> int { r.number });
+    var cited: [int] = [];
+    for n in sort(numbers) {
+        if (cited.len() == 0 || cited[cited.len() - 1] != n) {
+            cited.push(n);
+        }
+    }
+    var still_open: [int] = [];
+    var unknown: [int] = [];
+    for n in cited {
+        match (entries.get(n)) {
+            Option.Some(e) => {
+                if (e.open) {
+                    still_open.push(n);
+                }
+            },
+            Option.None => unknown.push(n),
+        }
+    }
+    CampaignState { cited: cited, still_open: still_open, unknown: unknown, unparsed: c.unparsed }
+}
+
+fn is_archivable(s: CampaignState) -> bool {
+    s.cited.len() > 0 && s.still_open.len() == 0 && s.unknown.len() == 0 && s.unparsed.len() == 0
+}
+
+/// Reasons a campaign needs a person (an open finding is not one: it is simply still open).
+fn blockers(s: CampaignState) -> [string] {
+    var out: [string] = [];
+    if (s.cited.len() == 0 && s.unparsed.len() == 0) {
+        out.push("cites no finding (neither `###` entries nor `| # | estado |` rows)");
+    }
+    if (s.unknown.len() > 0) {
+        let names = s.unknown.map(fn(n: int) -> string { "#${n}" }).join(", ");
+        out.push("cites findings that do not exist: ${names}");
+    }
+    for (line, _) in s.unparsed {
+        out.push("line ${line}: status row without a valid finding number");
+    }
+    out
+}
+
+/// A header against its latest measurement, and open findings left in closed/. Legacy rows are not
+/// trusted for this.
+fn consistency_warnings(
+    entries: [findings.Entry],
+    measured: Map<int, [findings.Row]>
+) -> [(findings.Entry, string)] {
+    var out: [(findings.Entry, string)] = [];
+    for e in entries {
+        if (e.open && e.file.starts_with("closed/")) {
+            out.push((e, "open header in a file under closed/"));
+        }
+        let rows = measured
+            .get_or(e.number, [])
+            .filter(fn(r: findings.Row) -> bool { !findings.is_legacy(r.file) });
+        if (rows.len() > 0) {
+            let last = rows[rows.len() - 1];
+            let where = "${last.mark} (${last.version}, ${last.file}:${last.line})";
+            if (e.open && findings.is_closing(last.mark)) {
+                out.push((e, "open header, but the latest measurement is ${where}"));
+            }
+            if (!e.open && !findings.is_closing(last.mark)) {
+                out.push((e, "closed header, but the latest measurement is ${where}: regression?"));
+            }
+        }
+    }
+    out
+}
+
+/// `### N` lines that are not entries: the parser would silently lose them.
+fn malformed_headings(content: string) -> [(int, string)] {
+    var out: [(int, string)] = [];
+    let lines = content.split("\n");
+    for i in 0..lines.len() {
+        let rest = lines[i].strip_prefix("###").unwrap_or("").trim();
+        if (rest != ""
+            && rest[0] >= '0'
+            && rest[0] <= '9'
+            && findings.parse_heading(lines[i]).is_none()) {
+            out.push((i + 1, lines[i]));
+        }
+    }
+    out
+}
+
+// ---- index ----
+
+fn index_row(e: findings.Entry) -> string {
+    "| ${e.number} | ${e.kind} | ${findings.status(e)} | ${e.affects} | ${or_dash(e.app)} | ${or_dash(e.version)} | ${e.title} | ${or_dash(e.issue)} | [${findings.stem(e.file)}](${e.file}) |"
+}
+
+fn iso_today() -> string {
+    let d = time.now_local();
+    "${d.year}-${pad2(d.month)}-${pad2(d.day)}"
+}
+
+/// The open ones of each target, most first; ties by name.
+fn targets_by_count(by_target: Map<string, int>) -> [string] {
+    sort_by(by_target.keys(), fn(a: string, b: string) -> bool {
+        let x = by_target.get_or(a, 0);
+        let y = by_target.get_or(b, 0);
+        if (x != y) { x > y } else { a < b }
+    })
+}
+
+fn index_summary(by_target: Map<string, int>) -> string {
+    targets_by_count(by_target)
+        .map(fn(t: string) -> string { "**${t}** ${by_target.get_or(t, 0)}" })
+        .join(" · ")
+}
+
+fn index_text(entries: [findings.Entry], today: string) -> string {
+    let opened = entries.filter(fn(e: findings.Entry) -> bool { e.open });
+    let counts: Map<string, int> = Map.new();
+    for e in opened {
+        counts.insert(e.affects, counts.get_or(e.affects, 0) + 1);
+    }
+    let summary = index_summary(counts);
+    let bugs = opened.filter(fn(e: findings.Entry) -> bool { e.kind.contains("B") }).len();
+    let summary_text = if (summary == "") { "ninguno" } else { summary };
+    var lines = [
+        "# Hallazgos del ecosistema raylang — índice",
+        "",
+        "Generado por `tools/findings index` (${today}). ${entries.len()} hallazgos, **${opened.len()} abiertos** (${bugs} de tipo B). Abiertos por componente afectado: ${summary_text}. No editar a mano: edita la cabecera de la entrada en su archivo y regenera.",
+        "",
+        "Leyenda: **B** bug · **D** documentación · **E** ergonomía/API · ✅ verificado · ⚠️ parcial · ❌ sigue fallando · ➖ solo documentado / no se arregla · «abierto» = sin marca en la cabecera. «afecta a» = quién arregla (sin `**Afecta a:**` en la entrada = raylang); «app» = quién lo encontró y re-mide.",
+        ""
+    ];
+    // raylang first, then by name.
+    let targets = sort_by(counts.keys(), fn(a: string, b: string) -> bool {
+        if ((a == findings.DEFAULT_TARGET) != (b == findings.DEFAULT_TARGET)) {
+            a == findings.DEFAULT_TARGET
+        } else {
+            a < b
+        }
+    });
+    for target in targets {
+        let es = opened.filter(fn(e: findings.Entry) -> bool { e.affects == target });
+        lines = lines
+            + ["## Abiertos — afecta a ${target} (${es.len()})", ""]
+            + TABLE_HEAD
+            + es.map(index_row)
+            + [""];
+    }
+    if (targets.len() == 0) {
+        lines = lines + ["## Abiertos", "", "ninguno", ""];
+    }
+    lines = lines + ["## Todos", ""] + TABLE_HEAD + entries.map(index_row);
+    lines.join("\n") + "\n"
+}
+
+/// Regenerates findings/INDEX.md under a ray-apps root.
+pub fn write_index(root: string) -> Result<IndexResult, string> {
+    let dir = dir_of(root);
+    let entries = findings.load(dir)?;
+    fs.write_file("${dir}/INDEX.md", index_text(entries, iso_today()))?;
+    let opened = entries.filter(fn(e: findings.Entry) -> bool { e.open });
+    let counts: Map<string, int> = Map.new();
+    for e in opened {
+        counts.insert(e.affects, counts.get_or(e.affects, 0) + 1);
+    }
+    let summary = index_summary(counts);
+    var warnings: [string] = [];
+    let targets = known_targets(root);
+    for e in opened {
+        for p in problems(e, targets) {
+            warnings.push("warning: #${e.number} — ${p}");
+        }
+    }
+    let shown = if (summary == "") { "none" } else { summary };
+    Result.Ok(
+        IndexResult {
+            summary: "findings/INDEX.md: ${entries.len()} findings, ${opened.len()} open (${shown})",
+            warnings: warnings
+        }
+    )
+}
+
+fn report_index(root: string, o: Output) {
+    match (write_index(root)) {
+        Result.Ok(r) => {
+            o.out.push(r.summary);
+            o.err = o.err + r.warnings;
+        },
+        Result.Err(e) => fail(o, 1, e),
+    }
+}
+
+// ---- writing a re-measurement ----
+
+/// Replaces a file in one step: a failed write must not leave a campaign half written.
+fn write_atomic(path: string, text: string) -> Result<int, string> {
+    let mode = fs.stat(path)?.mode;
+    let tmp = "${path}.tmp-${time.monotonic_nanos()}";
+    let written = fs.write_file(tmp, text)
+        .and_then(fn(_: int) -> Result<int, string> { fs.chmod(tmp, mode) })
+        .and_then(fn(_: int) -> Result<int, string> { fs.rename(tmp, path) });
+    if (written.is_err() && fs.exists(tmp)) {
+        fs.remove_file(tmp);
+    }
+    written
+}
+
+pub fn set_header_mark(text: string, n: int, mark: string) -> Result<string, string> {
+    let lines = text.split("\n");
+    for i in 0..lines.len() {
+        match (findings.parse_heading(lines[i])) {
+            Option.Some(h) => {
+                if (h.number == n) {
+                    lines[i] = "### ${n}. ${mark} [${h.kind}] ${h.title}";
+                    return Result.Ok(lines.join("\n"));
+                }
+            },
+            Option.None => { },
+        }
+    }
+    Result.Err("no header for #${n}")
+}
+
+/// Adds the row at the end of the file's last status table, or a new table if it has none.
+pub fn insert_status_row(
+    text: string,
+    n: int,
+    mark: string,
+    version: string,
+    evidence: string
+) -> string {
+    let lines = text.split("\n");
+    var head = -1;
+    var end = -1;
+    for i in 0..lines.len() {
+        if (findings.is_status_head(lines[i])) {
+            head = i;
+            end = i + 1;
+            while (end < lines.len() && lines[end].starts_with("|")) {
+                end = end + 1;
+            }
+        }
+    }
+    let row = "| ${n} | ${mark} ${version} | ${evidence} |";
+    if (head < 0) {
+        var at = lines.len();
+        for i in 0..lines.len() {
+            if (findings.parse_heading(lines[i]).is_some()) {
+                at = i;
+                break;
+            }
+        }
+        let table = ["| # | estado | evidencia |", "|---:|---|---|", row, ""];
+        return (lines.slice(0, at) + table + lines.slice(at, lines.len())).join("\n");
+    }
+    // Some campaigns add columns (`adoptado en`); keep their rows the same width.
+    let columns = lines[head].split("|").len() - 2;
+    let extra = if (columns > 3) { columns - 3 } else { 0 };
+    let wide = row + " — |".repeat(extra);
+    (lines.slice(0, end) + [wide] + lines.slice(end, lines.len())).join("\n")
+}
+
+/// One table cell from free text: one line, its pipes escaped.
+fn clean_evidence(text: string) -> string {
+    text
+        .split("\n")
+        .map(fn(l: string) -> string { l.trim() })
+        .filter(fn(l: string) -> bool { l != "" })
+        .join(" ")
+        .replace("|", "\\|")
+}
+
+// ---- arguments ----
+
+struct Flags {
+    values: Map<string, string>,
+    switches: [string],
+    positional: [string],
+}
+
+fn parse_flags(a: [string], valued: [string], switches: [string]) -> Result<Flags, string> {
+    let values: Map<string, string> = Map.new();
+    var on: [string] = [];
+    var positional: [string] = [];
+    var i = 0;
+    while (i < a.len()) {
+        let arg = a[i];
+        i = i + 1;
+        if (!arg.starts_with("--")) {
+            positional.push(arg);
+            continue;
+        }
+        let eq = arg.index_of("=");
+        let name = match (eq) {
+            Option.Some(at) => arg.substring(0, at),
+            Option.None => arg,
+        };
+        if (switches.contains(name)) {
+            on.push(name);
+        } else {
+            if (!valued.contains(name)) {
+                return Result.Err("unknown option ${name}");
+            }
+            match (eq) {
+                Option.Some(at) => values.insert(name, arg.substring(at + 1, arg.len())),
+                Option.None => {
+                    if (i >= a.len()) {
+                        return Result.Err("${name} wants a value");
+                    }
+                    values.insert(name, a[i]);
+                    i = i + 1;
+                },
+            }
+        }
+    }
+    Result.Ok(Flags { values: values, switches: on, positional: positional })
+}
+
+fn required(f: Flags, names: [string]) -> Result<int, string> {
+    for name in names {
+        if (!f.values.contains_key(name)) {
+            return Result.Err("${name} is required");
+        }
+    }
+    Result.Ok(0)
+}
+
+fn value(f: Flags, name: string) -> string {
+    f.values.get_or(name, "")
+}
+
+/// Exit 2 is a wrong call, as in the rest of raymcp; exit 1 is a call that failed.
+fn fail(o: Output, code: int, msg: string) {
+    o.err.push("error: ${msg}");
+    o.code = code;
+}
+
+// ---- commands ----
+
+fn cmd_open(root: string, a: [string], o: Output) {
+    let f = match (parse_flags(a, ["--type", "--affects", "--app"], [])) {
+        Result.Ok(f) => f,
+        Result.Err(e) => return fail(o, 2, e),
+    };
+    let entries = match (findings.load(dir_of(root))) {
+        Result.Ok(es) => es,
+        Result.Err(e) => return fail(o, 1, e),
+    };
+    for e in entries {
+        if (e.open
+            && e.kind.contains(value(f, "--type"))
+            && (!f.values.contains_key("--affects") || e.affects == value(f, "--affects"))
+            && (!f.values.contains_key("--app") || e.app == value(f, "--app"))) {
+            let source = if (e.app_line == "") { e.section } else { e.app_line };
+            o.out.push(
+                "#${e.number} [${e.kind}] ${pad_left(findings.status(e), 8)}  affects ${pad_right(e.affects, 13)} ${e.title}  (${source}; ${e.file})"
+            );
+        }
+    }
+}
+
+fn cmd_check(root: string, o: Output) {
+    let campaigns = match (findings.load_campaigns(dir_of(root))) {
+        Result.Ok(c) => c,
+        Result.Err(e) => return fail(o, 1, e),
+    };
+    let entries = findings.entries_of(campaigns);
+    let targets = known_targets(root);
+    var warnings: [string] = [];
+    for (n, first, second) in findings.duplicates(campaigns) {
+        warnings.push("#${n} is in ${first} and in ${second}");
+    }
+    for e in entries {
+        for p in problems(e, targets) {
+            warnings.push("#${e.number} (${e.file}): ${p}");
+        }
+    }
+    for (e, p) in consistency_warnings(entries, findings.measurements(campaigns)) {
+        warnings.push("#${e.number} (${e.file}): ${p}");
+    }
+    let numbered = by_number(entries);
+    for c in campaigns {
+        for (line, text) in malformed_headings(c.content) {
+            let shown = text.substring(0, if (text.len() < 80) { text.len() } else { 80 });
+            warnings.push(
+                "${c.file}:${line}: unrecognized heading, the entry is ignored: ${shown}"
+            );
+        }
+        let state = campaign_state(c, numbered);
+        for p in blockers(state) {
+            warnings.push("${c.file}: ${p}");
+        }
+        if (c.file.starts_with("open/") && is_archivable(state)) {
+            warnings.push("${c.file}: everything closed, it can be archived (`findings archive`)");
+        }
+    }
+    o.out = o.out + warnings;
+    if (warnings.len() == 0) {
+        o.out.push("no warnings");
+    } else {
+        o.out.push("${warnings.len()} warning(s)");
+        o.code = 1;
+    }
+}
+
+fn number_arg(s: string) -> Option<int> {
+    if (findings.is_digits(s)) { parse_int(s) } else { Option.None }
+}
+
+fn cmd_history(root: string, a: [string], o: Output) {
+    let n = match (if (a.len() == 1) { number_arg(a[0]) } else { Option.None }) {
+        Option.Some(n) => n,
+        Option.None => return fail(o, 2, "history wants a finding number"),
+    };
+    let campaigns = match (findings.load_campaigns(dir_of(root))) {
+        Result.Ok(c) => c,
+        Result.Err(e) => return fail(o, 1, e),
+    };
+    let e = match (findings.find(findings.entries_of(campaigns), n)) {
+        Option.Some(e) => e,
+        Option.None => return fail(o, 1, "#${n} does not exist"),
+    };
+    o.out.push("#${e.number} ${findings.status(e)} [${e.kind}] ${e.title}");
+    o.out.push("  entry: ${e.file}");
+    let rows = findings.measurements(campaigns).get_or(n, []);
+    if (rows.len() == 0) {
+        o.out.push("  no measurements recorded");
+        return;
+    }
+    o.out.push(
+        "  " + rows.map(fn(r: findings.Row) -> string { "${r.version} ${r.mark}" }).join(" → ")
+    );
+    for r in rows {
+        let note = if (findings.is_legacy(r.file)) {
+            "  (legacy: order not reliably chronological)"
+        } else {
+            ""
+        };
+        let shown = r.evidence.substring(
+            0,
+            if (r.evidence.len() < 120) { r.evidence.len() } else { 120 }
+        );
+        o.out.push("  ${r.version} ${r.mark} ${r.file}:${r.line}${note}");
+        o.out.push("    ${shown}");
+    }
+}
+
+fn cmd_mark(root: string, a: [string], o: Output) {
+    let f = match (parse_flags(a, ["--app", "--version", "--evidence", "--how"], [])) {
+        Result.Ok(f) => f,
+        Result.Err(e) => return fail(o, 2, e),
+    };
+    match (required(f, ["--app", "--version", "--evidence"])) {
+        Result.Ok(_) => { },
+        Result.Err(e) => return fail(o, 2, e),
+    }
+    let n = match (if (f.positional.len() == 2) { number_arg(f.positional[0]) } else { Option.None }) {
+        Option.Some(n) => n,
+        Option.None => return fail(o, 2, "mark wants a finding number and a mark"),
+    };
+    let app = value(f, "--app");
+    let version = value(f, "--version");
+    let how = value(f, "--how");
+    if (!findings.valid_version(version)) {
+        return fail(o, 2, "--version must be X.Y.Z, got '${version}'");
+    }
+    // ⚠ without its variation selector is what some keyboards type.
+    let mark = if (f.positional[1] == "\u{26A0}") { "⚠️" } else { f.positional[1] };
+    if (!findings.MARKS.contains(mark)) {
+        return fail(o, 1, "mark must be one of ${findings.MARKS.join(" ")}");
+    }
+    let evidence = clean_evidence(value(f, "--evidence"));
+    if (evidence == "") {
+        return fail(o, 1, "--evidence cannot be empty");
+    }
+    if (!known_targets(root).contains(app)) {
+        return fail(o, 1, "--app ${app} is neither a component nor a ray-apps app");
+    }
+    match (mark_finding(root, n, mark, app, version, evidence, how, o)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => fail(o, 1, e),
+    }
+}
+
+fn mark_finding(
+    root: string,
+    n: int,
+    mark: string,
+    app: string,
+    version: string,
+    evidence: string,
+    how: string,
+    o: Output
+) -> Result<int, string> {
+    let dir = dir_of(root);
+    let before = findings.load_campaigns(dir)?;
+    if (findings.find(findings.entries_of(before), n).is_none()) {
+        return Result.Err("#${n} does not exist");
+    }
+    let rows = findings.measurements(before).get_or(n, []);
+    if (rows.len() > 0) {
+        let last = rows[rows.len() - 1];
+        if (findings.compare_versions(version, last.version) < 0) {
+            return Result.Err(
+                "#${n} was already measured with ${last.version} (${last.file}); ${version} is older and would hide it"
+            );
+        }
+    }
+    let (campaign, moved) = findings.campaign_path(dir, app, version)?;
+    if (moved != "") {
+        o.out.push(moved);
+    }
+    // campaign_path may have just moved the entry's own file.
+    var home = findings.find(findings.load(dir)?, n).unwrap().file;
+    if (!findings.is_closing(mark) && home.starts_with("closed/")) {
+        // A regression: closed/ must never hold anything open.
+        let reopened = "open/${findings.base_name(home)}";
+        findings.move_file(dir, home, reopened)?;
+        o.out.push("${home} → ${reopened} (#${n} reopened)");
+        home = reopened;
+    }
+    let created = findings.ensure_campaign(dir, campaign, app, version, how)?;
+    if (home == campaign) {
+        let text = set_header_mark(fs.read_file("${dir}/${home}")?, n, mark)?;
+        write_atomic("${dir}/${home}", insert_status_row(text, n, mark, version, evidence))?;
+    } else {
+        // Compute both before writing either.
+        let header = set_header_mark(fs.read_file("${dir}/${home}")?, n, mark)?;
+        let row = insert_status_row(
+            fs.read_file("${dir}/${campaign}")?,
+            n,
+            mark,
+            version,
+            evidence
+        );
+        write_atomic("${dir}/${home}", header)?;
+        write_atomic("${dir}/${campaign}", row)?;
+    }
+    o.out.push("#${n} ${mark}: header in ${home}, row in ${campaign}");
+    if (created && how == "") {
+        o.out.push("note: fill in how it was measured in ${campaign} (or pass --how)");
+    }
+    report_index(root, o);
+    Result.Ok(0)
+}
+
+fn cmd_archive(root: string, a: [string], o: Output) {
+    let f = match (parse_flags(a, [], ["--dry-run"])) {
+        Result.Ok(f) => f,
+        Result.Err(e) => return fail(o, 2, e),
+    };
+    let dry_run = f.switches.contains("--dry-run");
+    let dir = dir_of(root);
+    let campaigns = match (findings.load_campaigns(dir)) {
+        Result.Ok(c) => c,
+        Result.Err(e) => return fail(o, 1, e),
+    };
+    let numbered = by_number(findings.entries_of(campaigns));
+    let d = time.now_local();
+    let month = "${d.year}-${pad2(d.month)}";
+    var moved = 0;
+    var planned = 0;
+    for c in campaigns {
+        if (!c.file.starts_with("open/")) {
+            continue;
+        }
+        let state = campaign_state(c, numbered);
+        for p in blockers(state) {
+            o.err.push("warning: ${c.file} not archived: ${p}");
+        }
+        if (!is_archivable(state)) {
+            continue;
+        }
+        let dest = "closed/${month}/${findings.base_name(c.file)}";
+        if (fs.exists("${dir}/${dest}")) {
+            o.err.push("warning: ${c.file} not archived: ${dest} already exists");
+            continue;
+        }
+        planned = planned + 1;
+        let prefix = if (dry_run) { "(dry-run) " } else { "" };
+        o.out.push("${prefix}${c.file} → ${dest}  (${state.cited.len()} findings, all closed)");
+        if (!dry_run) {
+            match (findings.move_file(dir, c.file, dest)) {
+                Result.Ok(_) => moved = moved + 1,
+                Result.Err(e) => return fail(o, 1, e),
+            }
+        }
+    }
+    if (moved > 0) {
+        report_index(root, o);
+    }
+    if (planned == 0) {
+        o.out.push("nothing to archive");
+    }
+}
+
+fn cmd_new(root: string, a: [string], o: Output) {
+    let f = match (parse_flags(
+        a,
+        ["--app", "--version", "--versions", "--type", "--affects", "--title"],
+        []
+    )) {
+        Result.Ok(f) => f,
+        Result.Err(e) => return fail(o, 2, e),
+    };
+    match (required(f, ["--app", "--version", "--type", "--title"])) {
+        Result.Ok(_) => { },
+        Result.Err(e) => return fail(o, 2, e),
+    }
+    let n = findings.NewEntry {
+        app: value(f, "--app"),
+        version: value(f, "--version"),
+        versions: value(f, "--versions"),
+        kind: value(f, "--type"),
+        title: value(f, "--title"),
+        affects: value(f, "--affects"),
+        body: "<qué se hizo, qué se esperaba, qué pasó; repro mínimo; propuesta>",
+        measured: ""
+    };
+    let problem = findings.check(n, findings.apps(root));
+    if (problem != "") {
+        return fail(o, 1, problem);
+    }
+    match (add_new(root, n, o)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => fail(o, 1, e),
+    }
+}
+
+fn add_new(root: string, n: findings.NewEntry, o: Output) -> Result<int, string> {
+    let dir = dir_of(root);
+    let (_, moved) = findings.campaign_path(dir, n.app, n.version)?;
+    if (moved != "") {
+        o.out.push(moved);
+    }
+    let (number, rel) = findings.add(dir, findings.load(dir)?, n)?;
+    let target = if (n.affects == "") { findings.DEFAULT_TARGET } else { n.affects };
+    o.out.push("#${number} → findings/${rel} (affects ${target})");
+    report_index(root, o);
+    Result.Ok(number)
+}
+
+/// Runs one `raymcp findings` command against the ray-apps directory `root`.
+pub fn run(root: string, a: [string]) -> Output {
+    let o = Output { code: 0, out: [], err: [] };
+    if (a.len() == 0 || a[0] == "help") {
+        o.out.push(USAGE);
+        o.code = if (a.len() == 0) { 2 } else { 0 };
+        return o;
+    }
+    if (!fs.is_dir("${dir_of(root)}/open")) {
+        fail(o, 1, "${root}: no findings/open here (use --root)");
+        return o;
+    }
+    let rest = a.slice(1, a.len());
+    match (a[0]) {
+        "new" => cmd_new(root, rest, o),
+        "mark" => cmd_mark(root, rest, o),
+        "history" => cmd_history(root, rest, o),
+        "open" => cmd_open(root, rest, o),
+        "check" => cmd_check(root, o),
+        "index" => report_index(root, o),
+        "archive" => cmd_archive(root, rest, o),
+        _ => {
+            o.err.push(USAGE);
+            o.code = 2;
+        },
+    }
+    o
+}

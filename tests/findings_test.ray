@@ -43,6 +43,29 @@ fn loads_open_and_closed_campaigns() {
 }
 
 @test
+fn a_partial_or_failing_mark_is_still_open() {
+    // The header decides: ✅ and ➖ close a finding, ⚠️ and ❌ do not.
+    let content = "### 1. ⚠️ [E] a\n**App:** x (raylang 1.27.60)\n\n### 2. ❌ [B] b\n**App:** x (raylang 1.27.60)\n\n### 3. ➖ [D] c\n**App:** x (raylang 1.27.60)\n";
+    let es = findings.parse_file("closed/2026-09/x-1.27.60.md", content);
+    assert(es[0].open);
+    assert(es[1].open);
+    assert(!es[2].open);
+    assert_eq(findings.status(es[0]), "⚠️");
+}
+
+@test
+fn app_lines_give_the_raylang_version() {
+    let es = findings.parse_file(
+        "open/x.md",
+        "### 1. [E] a\n**App:** rayvault (net 0.12.1, raylang 1.27.85, oidc 0.1.0)\n\n### 2. [E] b\n**App:** raycode; adoptado en raymart\n"
+    );
+    assert_eq(es[0].app, "rayvault");
+    assert_eq(es[0].version, "1.27.85");
+    assert_eq(es[1].app, "raycode; adoptado en raymart");
+    assert_eq(es[1].version, "");
+}
+
+@test
 fn search_filters_and_orders_newest_first() {
     let es = findings.load(DIR).unwrap();
     let (all, n) = findings.search(es, findings.query(""));
@@ -94,6 +117,8 @@ fn new_entries_are_checked() {
     assert_eq(findings.check(entry("rayalpha", "B", ""), apps), "");
     assert_eq(findings.check(entry("rayalpha", "D/E", "net"), apps), "");
     assert_eq(findings.check(entry("rayalpha", "B", "raybeta"), apps), "");
+    assert_eq(findings.check(entry("rayalpha", "B", "oidc"), apps), "");
+    assert_eq(findings.check(entry("rayalpha", "B", "mcp"), apps), "");
     assert(findings.check(entry("rayalpha", "B", "rayalpha"), apps).contains("itself"));
     assert(findings.check(entry("rayalpha", "X", ""), apps).contains("type"));
     assert(findings.check(entry("rayalpha", "B", "nobody"), apps).contains("neither"));
@@ -131,5 +156,22 @@ fn adding_takes_the_next_number_and_creates_the_campaign() {
     let again = findings.load(dir).unwrap();
     assert_eq(findings.find(again, 7).unwrap().file, rel);
     assert(findings.find(again, 6).unwrap().open);
+    fs.remove_all(tmp);
+}
+
+@test
+fn adding_to_an_archived_campaign_brings_it_back_instead_of_duplicating_it() {
+    let tmp = fs.make_temp_dir("raymcp-test").unwrap();
+    fs.copy_all(DIR, "${tmp}/findings").unwrap();
+    let dir = "${tmp}/findings";
+    var n = entry("raybeta", "B", "");
+    n.version = "1.27.50";
+    let (number, rel) = findings.add(dir, findings.load(dir).unwrap(), n).unwrap();
+    assert_eq(number, 6);
+    assert_eq(rel, "open/raybeta-1.27.50.md");
+    assert(!fs.exists("${dir}/closed/2026-09/raybeta-1.27.50.md"));
+    let text = fs.read_file("${dir}/${rel}").unwrap();
+    assert(text.contains("### 1. ✅"));
+    assert(text.contains("### 6. [B]"));
     fs.remove_all(tmp);
 }
