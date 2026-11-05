@@ -1,7 +1,7 @@
 [package]
 name = "raymcp"
 version = "0.1.0"
-raylang = "1.27.73"
+raylang = "1.27.87"
 license = "Apache-2.0"
 
 [dependencies]

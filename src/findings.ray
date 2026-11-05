@@ -1,6 +1,7 @@
 //! The findings of ray-apps as data: `findings/open/*.md` and `findings/closed/*/*.md`, one
-//! campaign per file, one entry per `### N. [T] Title` heading. Reading is pure raylang; adding
-//! an entry writes the campaign file the same way `tools/findings.py new` does.
+//! campaign per file, one entry per `### N. [T] Title` heading, plus the `| # | estado |` tables
+//! where a campaign records its measurements, of its own entries or of others'. The commands that
+//! act on all this are in `findings_cli.ray`.
 
 import std/fs;
 import std/time;
@@ -11,19 +12,56 @@ pub struct Entry {
     mark: string,
     kind: string,
     title: string,
+    /// Who found it: the `**App:**` line up to the parenthesis.
     app: string,
+    /// The whole `**App:**` line.
+    app_line: string,
     versions: string,
+    /// The raylang version in the `**App:**` line, or "".
+    version: string,
     affects: string,
+    /// Whether the entry has an `**Afecta a:**` line.
+    affects_explicit: bool,
     issue: string,
+    /// The `## ` section the entry is under.
+    section: string,
     /// Relative to the findings directory: `open/rayffi-1.27.65.md`.
     file: string,
-    /// In a file under `open/` and without a mark.
+    /// Not closed by its mark: no mark, ⚠️ or ❌, wherever the file is. The header is the truth.
     open: bool,
+    /// The last mark of this finding in its own file's status tables, or "".
+    table: string,
     /// The whole entry, heading included.
     text: string,
 }
 
+/// One finding's line in a status table. `mark` is "" when it measures nothing (`—`, `abierto`).
+pub struct Row {
+    number: int,
+    mark: string,
+    version: string,
+    evidence: string,
+    file: string,
+    line: int,
+}
+
+/// One file: what it holds and what its status tables say.
+pub struct Campaign {
+    file: string,
+    content: string,
+    entries: [Entry],
+    rows: [Row],
+    /// (line, text) of the status-table rows that cite no valid finding.
+    unparsed: [(int, string)],
+}
+
 pub const MARKS: [string] = ["✅", "⚠️", "❌", "➖"];
+
+pub const DEFAULT_TARGET: string = "raylang";
+
+pub fn is_closing(mark: string) -> bool {
+    mark == "✅" || mark == "➖"
+}
 
 pub struct Heading {
     number: int,
@@ -60,34 +98,158 @@ pub fn parse_heading(line: string) -> Option<Heading> {
     )
 }
 
-fn field(lines: [string], name: string) -> string {
-    let prefix = "**${name}:** ";
+/// The value of the last `**name:**` line, if there is one.
+fn field(lines: [string], name: string) -> Option<string> {
+    let prefix = "**${name}:**";
+    var out: Option<string> = Option.None;
     for l in lines {
         match (l.strip_prefix(prefix)) {
-            Option.Some(v) => return v.trim(),
+            Option.Some(v) => out = Option.Some(v.trim()),
             Option.None => { },
         }
     }
-    ""
+    out
 }
 
 /// `rayffi (raylang 1.27.65, net 0.10.1)` → ("rayffi", "raylang 1.27.65, net 0.10.1").
 fn split_app(s: string) -> (string, string) {
-    match (s.index_of(" (")) {
+    match (s.index_of("(")) {
         Option.Some(i) => {
-            let inner = s.substring(i + 2, s.len());
-            (s.substring(0, i), inner.strip_suffix(")").unwrap_or(inner))
+            let inner = s.substring(i + 1, s.len());
+            (s.substring(0, i).trim(), inner.strip_suffix(")").unwrap_or(inner))
         },
-        Option.None => (s, ""),
+        Option.None => (s.trim(), ""),
     }
 }
 
-/// Every entry of one campaign file.
-pub fn parse_file(file: string, content: string, in_open: bool) -> [Entry] {
+fn is_digit(c: char) -> bool {
+    c >= '0' && c <= '9'
+}
+
+fn is_word_char(c: char) -> bool {
+    is_digit(c)
+        || (c >= 'a' && c <= 'z')
+        || (c >= 'A' && c <= 'Z')
+        || c == '_'
+        || char_code(c) > 127
+}
+
+pub fn is_digits(s: string) -> bool {
+    s != "" && s.chars().filter(fn(c: char) -> bool { !is_digit(c) }).len() == 0
+}
+
+/// The text after each whole-word appearance of `word` in `s`, first to last.
+fn after_word(s: string, word: string) -> [string] {
+    var out: [string] = [];
+    var rest = s;
+    var before = ' ';
+    while (true) {
+        match (rest.index_of(word)) {
+            Option.Some(i) => {
+                let previous = if (i > 0) { rest[i - 1] } else { before };
+                let tail = rest.substring(i + word.len(), rest.len());
+                if (!is_word_char(previous) && previous != '-') {
+                    out.push(tail);
+                }
+                before = word[word.len() - 1];
+                rest = tail;
+            },
+            Option.None => break,
+        }
+    }
+    out
+}
+
+/// How many characters at the start of `cs` from `at` on are digits.
+fn digits_at(cs: [char], at: int) -> int {
+    var i = at;
+    while (i < cs.len() && is_digit(cs[i])) {
+        i = i + 1;
+    }
+    i - at
+}
+
+/// The `X.Y` or `X.Y.Z` a text starts with, with `parts` numbers: end index in `cs`, or -1.
+fn dotted_end(cs: [char], at: int, parts: int) -> int {
+    var i = at;
+    for p in 0..parts {
+        if (p > 0) {
+            if (i >= cs.len() || cs[i] != '.') {
+                return -1;
+            }
+            i = i + 1;
+        }
+        let n = digits_at(cs, i);
+        if (n == 0) {
+            return -1;
+        }
+        i = i + n;
+    }
+    i
+}
+
+/// The X.Y.Z a text starts with.
+fn semver_prefix(s: string) -> Option<string> {
+    let cs = s.chars();
+    let end = dotted_end(cs, 0, 3);
+    if (end < 0) { Option.None } else { Option.Some(s.substring(0, end)) }
+}
+
+/// The first X.Y.Z anywhere in a text, not glued to a word.
+fn first_semver(s: string) -> Option<string> {
+    let cs = s.chars();
+    for i in 0..cs.len() {
+        if (is_digit(cs[i]) && (i == 0 || !is_word_char(cs[i - 1]))) {
+            let end = dotted_end(cs, i, 3);
+            if (end > 0 && (end == cs.len() || !is_word_char(cs[end]))) {
+                return Option.Some(s.substring(i, end));
+            }
+        }
+    }
+    Option.None
+}
+
+/// The raylang version in an `**App:**` line: `raylang 1.27.64`, `raylang v1.27`… The last wins.
+fn raylang_version(app_line: string) -> string {
+    var out = "";
+    for tail in after_word(app_line, "raylang") {
+        let cs = tail.chars();
+        var i = 0;
+        while (i < cs.len() && (cs[i] == ' ' || cs[i] == '\t')) {
+            i = i + 1;
+        }
+        if (i > 0) {
+            if (i < cs.len() && cs[i] == 'v') {
+                i = i + 1;
+            }
+            let start = i;
+            var end = dotted_end(cs, i, 2);
+            if (end > 0) {
+                while (end < cs.len()
+                    && (is_digit(cs[end])
+                        || (cs[end] >= 'a' && cs[end] <= 'z')
+                        || (cs[end] >= 'A' && cs[end] <= 'Z')
+                        || cs[end] == '.'
+                        || cs[end] == '-')) {
+                    end = end + 1;
+                }
+                out = tail.substring(start, end);
+            }
+        }
+    }
+    out
+}
+
+/// Every entry of one campaign file, without the marks of its tables (`load_campaign` adds them).
+pub fn parse_file(file: string, content: string) -> [Entry] {
     var out: [Entry] = [];
     let lines = content.split("\n");
+    var section = "";
     var i = 0;
     while (i < lines.len()) {
+        if (lines[i].starts_with("## ")) {
+            section = lines[i].substring(3, lines[i].len()).trim();
+        }
         match (parse_heading(lines[i])) {
             Option.Some(h) => {
                 var j = i + 1;
@@ -97,8 +259,10 @@ pub fn parse_file(file: string, content: string, in_open: bool) -> [Entry] {
                     j = j + 1;
                 }
                 let block = lines.slice(i, j);
-                let (app, versions) = split_app(field(block, "App"));
+                let app_line = field(block, "App").unwrap_or("");
+                let (app, versions) = split_app(app_line);
                 let affects = field(block, "Afecta a");
+                let target = affects.unwrap_or("");
                 out.push(
                     Entry {
                         number: h.number,
@@ -106,11 +270,16 @@ pub fn parse_file(file: string, content: string, in_open: bool) -> [Entry] {
                         kind: h.kind,
                         title: h.title,
                         app: app,
+                        app_line: app_line,
                         versions: versions,
-                        affects: if (affects == "") { "raylang" } else { affects },
-                        issue: field(block, "Issue"),
+                        version: raylang_version(app_line),
+                        affects: if (target == "") { DEFAULT_TARGET } else { target },
+                        affects_explicit: affects.is_some(),
+                        issue: field(block, "Issue").unwrap_or(""),
+                        section: section,
                         file: file,
-                        open: in_open && h.mark == "",
+                        open: !is_closing(h.mark),
+                        table: "",
                         text: block.join("\n").trim()
                     }
                 );
@@ -122,35 +291,323 @@ pub fn parse_file(file: string, content: string, in_open: bool) -> [Entry] {
     out
 }
 
-fn md_files(dir: string) -> [string] {
-    fs.list_dir(dir).unwrap_or([]).filter(fn(n: string) -> bool { n.ends_with(".md") })
+// ---- versions and status tables ----
+
+/// `1.27.9` before `1.27.50`: negative, zero or positive, as numbers and not as text.
+pub fn compare_versions(a: string, b: string) -> int {
+    let xs = a.split(".");
+    let ys = b.split(".");
+    for i in 0..xs.len() {
+        if (i >= ys.len()) {
+            return 1;
+        }
+        let d = parse_int(xs[i]).unwrap_or(0) - parse_int(ys[i]).unwrap_or(0);
+        if (d != 0) {
+            return d;
+        }
+    }
+    if (xs.len() < ys.len()) { -1 } else { 0 }
 }
 
-/// Loads every entry under `dir` (the `findings/` directory), sorted by number.
-pub fn load(dir: string) -> Result<[Entry], string> {
-    if (!fs.is_dir("${dir}/open")) {
-        return Result.Err("${dir}: not a findings directory (no open/ inside)");
+/// `open/rayffi-1.27.65.md` → `rayffi-1.27.65.md`.
+pub fn base_name(file: string) -> string {
+    let parts = file.split("/");
+    parts[parts.len() - 1]
+}
+
+/// `open/rayffi-1.27.65.md` → `rayffi-1.27.65`.
+pub fn stem(file: string) -> string {
+    let name = base_name(file);
+    name.strip_suffix(".md").unwrap_or(name)
+}
+
+fn campaign_version(file: string) -> string {
+    let parts = stem(file).split("-");
+    if (parts.len() > 1) {
+        let last = parts[parts.len() - 1];
+        if (semver_prefix(last).unwrap_or("") == last) {
+            return last;
+        }
     }
-    var all: [Entry] = [];
-    for name in md_files("${dir}/open") {
-        let text = fs.read_file("${dir}/open/${name}")?;
-        all = all + parse_file("open/${name}", text, true);
+    "0.0.0"
+}
+
+/// The pre-campaign file mixes versions in tables whose order is not reliably chronological.
+pub fn is_legacy(file: string) -> bool {
+    base_name(file).starts_with("legacy-")
+}
+
+/// A campaign file may hold later re-measurements: `## Revisión con raylang 1.27.54` or
+/// `Re-medido el 29 Oct 2026 con la release 1.27.86`. They apply to the rows that follow them.
+fn remeasure_note(line: string) -> Option<string> {
+    var found: Option<string> = Option.None;
+    if (line.starts_with("## ")) {
+        for tail in after_word(line, "raylang") {
+            let v = tail
+                .strip_prefix(" ")
+                .and_then(fn(t: string) -> Option<string> { semver_prefix(t) });
+            if (v.is_some()) {
+                found = v;
+            }
+        }
+        return found;
     }
-    for month in fs.list_dir("${dir}/closed").unwrap_or([]) {
-        if (fs.is_dir("${dir}/closed/${month}")) {
-            for name in md_files("${dir}/closed/${month}") {
-                let text = fs.read_file("${dir}/closed/${month}/${name}")?;
-                all = all + parse_file("closed/${month}/${name}", text, false);
+    match (line.strip_prefix("Re-medido")) {
+        Option.Some(rest) => {
+            if (rest != "" && is_word_char(rest[0])) {
+                return Option.None;
+            }
+            // The earliest mention: the longest text after it.
+            var longest = -1;
+            for tail in after_word(rest, "release") + after_word(rest, "raylang") {
+                let v = tail
+                    .strip_prefix(" ")
+                    .and_then(fn(t: string) -> Option<string> { semver_prefix(t) });
+                if (v.is_some() && tail.len() > longest) {
+                    longest = tail.len();
+                    found = v;
+                }
+            }
+            found
+        },
+        Option.None => Option.None,
+    }
+}
+
+/// Findings cited by a row's first cell: `170`, `28 / 39`, `189, 223–225`, `100 (#7)`, or None.
+pub fn parse_row_numbers(cell: string) -> Option<[int]> {
+    var clean = "";
+    var depth = false;
+    for c in cell.chars() {
+        if (c == '(') {
+            depth = true;
+        }
+        if (!depth) {
+            clean = "${clean}${c}";
+        }
+        if (c == ')') {
+            depth = false;
+        }
+    }
+    var out: [int] = [];
+    for part in clean.replace("/", ",").split(",") {
+        let item = part.trim();
+        let bare = item.strip_prefix("#").unwrap_or(item);
+        let bounds = bare.replace("–", "-").split("-").map(fn(b: string) -> string { b.trim() });
+        if (bounds.len() > 2 || !is_digits(bounds[0]) || !is_digits(bounds[bounds.len() - 1])) {
+            return Option.None;
+        }
+        let low = parse_int(bounds[0])?;
+        let high = parse_int(bounds[bounds.len() - 1])?;
+        if (high < low) {
+            return Option.None;
+        }
+        for n in low..(high + 1) {
+            out.push(n);
+        }
+    }
+    Option.Some(out)
+}
+
+/// `| # | estado | evidencia |`. Only tables with this head hold measurements: other tables in a
+/// campaign (benchmarks…) can also start with a number and must not be read as findings.
+pub fn is_status_head(line: string) -> bool {
+    let cells = line.split("|");
+    cells.len() > 2
+        && cells[0] == ""
+        && cells[1].trim() == "#"
+        && cells[2].trim().split(" ")[0] == "estado"
+}
+
+fn is_separator(line: string) -> bool {
+    let cs = line.chars();
+    if (cs.len() < 2) {
+        return false;
+    }
+    for c in cs {
+        if (c != '|' && c != '-' && c != ':' && c != ' ' && c != '\t') {
+            return false;
+        }
+    }
+    true
+}
+
+fn leading_mark(state: string) -> string {
+    for m in MARKS {
+        if (state.starts_with(m)) {
+            return m;
+        }
+    }
+    ""
+}
+
+fn strip_trailing_pipes(s: string) -> string {
+    var out = s.trim();
+    while (out.ends_with("|")) {
+        out = out.substring(0, out.len() - 1).trim();
+    }
+    out
+}
+
+fn scan_status_tables(file: string, content: string) -> ([Row], [(int, string)]) {
+    var rows: [Row] = [];
+    var unparsed: [(int, string)] = [];
+    var current = campaign_version(file);
+    var in_table = false;
+    let lines = content.split("\n");
+    for i in 0..lines.len() {
+        let line = lines[i];
+        if (!line.starts_with("|")) {
+            in_table = false;
+            match (remeasure_note(line)) {
+                Option.Some(v) => {
+                    if (compare_versions(v, current) > 0) {
+                        current = v;
+                    }
+                },
+                Option.None => { },
+            }
+            continue;
+        }
+        if (is_status_head(line)) {
+            in_table = true;
+            continue;
+        }
+        if (!in_table || is_separator(line)) {
+            continue;
+        }
+        let cells = line.split("|");
+        let numbers = if (cells.len() > 3) { parse_row_numbers(cells[1]) } else { Option.None };
+        match (numbers) {
+            Option.Some(ns) => {
+                let state = cells[2].trim();
+                let mark = leading_mark(state);
+                let version = if (mark == "") { current } else {
+                    first_semver(state).unwrap_or(current)
+                };
+                let evidence = strip_trailing_pipes(cells.slice(3, cells.len()).join("|"));
+                for n in ns {
+                    rows.push(
+                        Row {
+                            number: n,
+                            mark: mark,
+                            version: version,
+                            evidence: evidence,
+                            file: file,
+                            line: i + 1
+                        }
+                    );
+                }
+            },
+            Option.None => unparsed.push((i + 1, line)),
+        }
+    }
+    (rows, unparsed)
+}
+
+pub fn parse_campaign(file: string, content: string) -> Campaign {
+    let entries = parse_file(file, content);
+    let (rows, unparsed) = scan_status_tables(file, content);
+    for r in rows {
+        if (r.mark != "") {
+            for e in entries {
+                if (e.number == r.number) {
+                    e.table = r.mark;
+                }
             }
         }
     }
-    Result.Ok(sort_by(all, fn(a: Entry, b: Entry) -> bool { a.number < b.number }))
+    Campaign { file: file, content: content, entries: entries, rows: rows, unparsed: unparsed }
+}
+
+fn md_files(dir: string) -> [string] {
+    sort(fs.list_dir(dir).unwrap_or([]).filter(fn(n: string) -> bool { n.ends_with(".md") }))
+}
+
+/// Every campaign under `dir` (the `findings/` directory): open ones first, then the closed by month.
+pub fn load_campaigns(dir: string) -> Result<[Campaign], string> {
+    if (!fs.is_dir("${dir}/open")) {
+        return Result.Err("${dir}: not a findings directory (no open/ inside)");
+    }
+    var out: [Campaign] = [];
+    for name in md_files("${dir}/open") {
+        out.push(parse_campaign("open/${name}", fs.read_file("${dir}/open/${name}")?));
+    }
+    for month in sort(fs.list_dir("${dir}/closed").unwrap_or([])) {
+        if (fs.is_dir("${dir}/closed/${month}")) {
+            for name in md_files("${dir}/closed/${month}") {
+                let file = "closed/${month}/${name}";
+                out.push(parse_campaign(file, fs.read_file("${dir}/${file}")?));
+            }
+        }
+    }
+    Result.Ok(out)
+}
+
+/// All the entries, sorted by number. A number in two files keeps the later one (`duplicates`).
+pub fn entries_of(campaigns: [Campaign]) -> [Entry] {
+    let by_number: Map<int, Entry> = Map.new();
+    for c in campaigns {
+        for e in c.entries {
+            by_number.insert(e.number, e);
+        }
+    }
+    sort_by(by_number.values(), fn(a: Entry, b: Entry) -> bool { a.number < b.number })
+}
+
+/// Numbers filed twice, as (number, one file, the other).
+pub fn duplicates(campaigns: [Campaign]) -> [(int, string, string)] {
+    let seen: Map<int, string> = Map.new();
+    var out: [(int, string, string)] = [];
+    for c in campaigns {
+        for e in c.entries {
+            match (seen.get(e.number)) {
+                Option.Some(first) => out.push((e.number, first, c.file)),
+                Option.None => { },
+            }
+            seen.insert(e.number, c.file);
+        }
+    }
+    out
+}
+
+/// Loads every entry under `dir`, sorted by number.
+pub fn load(dir: string) -> Result<[Entry], string> {
+    Result.Ok(entries_of(load_campaigns(dir)?))
+}
+
+fn row_before(a: Row, b: Row) -> bool {
+    let d = compare_versions(a.version, b.version);
+    if (d != 0) {
+        return d < 0;
+    }
+    if (base_name(a.file) != base_name(b.file)) {
+        return base_name(a.file) < base_name(b.file);
+    }
+    a.line < b.line
+}
+
+/// Every real measurement per finding, oldest first (same version: by file, then by line).
+pub fn measurements(campaigns: [Campaign]) -> Map<int, [Row]> {
+    let out: Map<int, [Row]> = Map.new();
+    for c in campaigns {
+        for r in c.rows {
+            if (r.mark != "") {
+                out.insert(r.number, out.get_or(r.number, []) + [r]);
+            }
+        }
+    }
+    for n in out.keys() {
+        out.insert(n, sort_by(out.get_or(n, []), row_before));
+    }
+    out
 }
 
 pub fn status(e: Entry) -> string {
-    if (e.open) { "abierto" } else {
-        if (e.mark == "") { "cerrado" } else { e.mark }
+    if (e.mark != "") {
+        return e.mark;
     }
+    if (e.table != "") { "${e.table} (tabla; falta en la cabecera)" } else { "abierto" }
 }
 
 pub struct Query {
@@ -267,7 +724,23 @@ pub struct NewEntry {
     measured: string,
 }
 
-pub const COMPONENTS: [string] = ["raylang", "net", "web", "rpc", "db", "ray-elements"];
+pub const COMPONENTS: [string] = [
+    "raylang",
+    "net",
+    "web",
+    "rpc",
+    "db",
+    "mcp",
+    "ray-elements",
+    "oidc"
+];
+
+/// The app directories of a ray-apps root: each is a valid finder and a valid `Afecta a`.
+pub fn apps(root: string) -> [string] {
+    fs.list_dir(root).unwrap_or([]).filter(fn(n: string) -> bool {
+        !n.starts_with(".") && n != "findings" && fs.is_dir("${root}/${n}")
+    })
+}
 
 fn valid_kind(k: string) -> bool {
     if (k == "") {
@@ -281,9 +754,9 @@ fn valid_kind(k: string) -> bool {
     true
 }
 
-fn valid_version(v: string) -> bool {
+pub fn valid_version(v: string) -> bool {
     let parts = v.split(".");
-    parts.len() == 3 && parts.filter(fn(p: string) -> bool { parse_int(p).is_some() }).len() == 3
+    parts.len() == 3 && parts.filter(fn(p: string) -> bool { is_digits(p) }).len() == 3
 }
 
 fn valid_name(s: string) -> bool {
@@ -299,7 +772,7 @@ fn valid_name(s: string) -> bool {
     true
 }
 
-/// What is wrong with `n`, or "" if nothing. Same rules as tools/findings.py: the finder is not
+/// What is wrong with `n`, or "" if nothing. The admission rules: the finder is not
 /// the owner, and the owner is a known component or an app.
 pub fn check(n: NewEntry, apps: [string]) -> string {
     if (!valid_name(n.app)) {
@@ -317,7 +790,7 @@ pub fn check(n: NewEntry, apps: [string]) -> string {
     if (n.body.trim() == "") {
         return "body is empty: say what was done, what was expected, what happened";
     }
-    let target = if (n.affects == "") { "raylang" } else { n.affects };
+    let target = if (n.affects == "") { DEFAULT_TARGET } else { n.affects };
     if (target == n.app) {
         return "'${n.app}' does not file findings about itself here: that goes to the app's issues";
     }
@@ -342,9 +815,65 @@ const MONTHS: [string] = [
     "Dec"
 ];
 
-fn today() -> string {
-    let d = time.now_utc();
+pub fn today() -> string {
+    let d = time.now_local();
     "${d.day} ${MONTHS[d.month - 1]} ${d.year}"
+}
+
+/// Moves a file inside `dir`, never over another: a rename would silently replace it.
+pub fn move_file(dir: string, source: string, dest: string) -> Result<int, string> {
+    if (fs.exists("${dir}/${dest}")) {
+        return Result.Err("${dest} already exists, not moving ${source} over it");
+    }
+    let parts = dest.split("/");
+    fs.mkdir("${dir}/${parts.slice(0, parts.len() - 1).join("/")}")?;
+    fs.rename("${dir}/${source}", "${dir}/${dest}")
+}
+
+/// Where a campaign lives, relative to `dir`, and a note if it moved. One already archived goes
+/// back to open/: it is being measured again, and a second file with its name could not be archived.
+pub fn campaign_path(
+    dir: string,
+    app: string,
+    version: string
+) -> Result<(string, string), string> {
+    let name = "${app}-${version}.md";
+    let rel = "open/${name}";
+    if (!fs.exists("${dir}/${rel}")) {
+        for month in sort(fs.list_dir("${dir}/closed").unwrap_or([])) {
+            let archived = "closed/${month}/${name}";
+            if (fs.exists("${dir}/${archived}")) {
+                move_file(dir, archived, rel)?;
+                return Result.Ok((rel, "${archived} → ${rel} (campaign in progress again)"));
+            }
+        }
+    }
+    Result.Ok((rel, ""))
+}
+
+/// Creates the campaign file if it is not there. `measured` is the "Cómo se midió" text ("" = the
+/// placeholder). Returns whether it created it.
+pub fn ensure_campaign(
+    dir: string,
+    rel: string,
+    app: string,
+    version: string,
+    measured: string
+) -> Result<bool, string> {
+    let path = "${dir}/${rel}";
+    if (fs.exists(path)) {
+        return Result.Ok(false);
+    }
+    let how = if (measured == "") {
+        "<release del binario, máquina, motor (VM/nativo/intérprete), SO>."
+    } else {
+        measured
+    };
+    fs.write_file(
+        path,
+        "# ${app}: revisión con raylang ${version} (${today()})\n\nCómo se midió: ${how}\n\n| # | estado | evidencia |\n|---:|---|---|\n\n"
+    )?;
+    Result.Ok(true)
 }
 
 /// Appends `n` to its campaign file under `dir`, creating the file if needed, with the next
@@ -357,21 +886,11 @@ pub fn add(dir: string, entries: [Entry], n: NewEntry) -> Result<(int, string), 
         }
     }
     let number = last + 1;
-    let rel = "open/${n.app}-${n.version}.md";
+    let (rel, _) = campaign_path(dir, n.app, n.version)?;
     let path = "${dir}/${rel}";
-    if (!fs.exists(path)) {
-        let measured = if (n.measured == "") {
-            "<release del binario, máquina, motor (VM/nativo/intérprete), SO>."
-        } else {
-            n.measured
-        };
-        fs.write_file(
-            path,
-            "# ${n.app}: revisión con raylang ${n.version} (${today()})\n\nCómo se midió: ${measured}\n\n| # | estado | evidencia |\n|---:|---|---|\n\n"
-        )?;
-    }
+    ensure_campaign(dir, rel, n.app, n.version, n.measured)?;
     let versions = "raylang ${n.version}" + if (n.versions == "") { "" } else { ", ${n.versions}" };
-    let target = if (n.affects == "") { "raylang" } else { n.affects };
+    let target = if (n.affects == "") { DEFAULT_TARGET } else { n.affects };
     let entry = "\n### ${number}. [${n.kind}] ${n.title.trim()}\n**App:** ${n.app} (${versions})\n**Afecta a:** ${target}\n\n${n.body.trim()}\n";
     fs.append_file(path, entry)?;
     Result.Ok((number, rel))

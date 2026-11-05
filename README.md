@@ -37,17 +37,17 @@ raymcp fake-model SCRIPT [--port N]            un modelo con guion, compatible c
 | `search_findings` (solo lectura) | palabras que deben aparecer todas, y filtros por tipo, app, a quién afecta y estado; los más nuevos primero |
 | `get_finding` (solo lectura) | el texto completo de uno, con su archivo y estado |
 | `findings_summary` (solo lectura) | cuántos hay, y los abiertos por tipo, componente y app |
-| `add_finding` | uno nuevo, con el siguiente número global, en el archivo de campaña de su app y versión. Regenera `INDEX.md` con `tools/findings.py` si está |
+| `add_finding` | uno nuevo, con el siguiente número global, en el archivo de campaña de su app y versión. Regenera `INDEX.md` |
 
 Recursos: `findings://index` (`INDEX.md`) y `findings://convention` (`findings/README.md`). Las
 instrucciones del servidor piden buscar antes de crear. `add_finding` aplica las reglas de
-`tools/findings.py`:
+admisión:
 - quien encuentra no es el dueño;
 - el componente afectado tiene que ser uno conocido o una app;
 - el tipo es B, D, E o una combinación;
 - la versión es X.Y.Z.
 
-Además, rechaza un título repetido. Cada llamada vuelve a leer los archivos, así que lo que otro
+Además, rechaza un título repetido. Si la campaña estaba archivada, la devuelve a `open/`. Cada llamada vuelve a leer los archivos, así que lo que otro
 haya escrito ya está.
 
 Para usarlo desde Claude Code:
@@ -56,6 +56,24 @@ Para usarlo desde Claude Code:
 make build
 claude mcp add raymcp -- /ruta/a/raymcp/raymcp serve --root /ruta/a/ray-apps
 ```
+
+## La herramienta de línea de órdenes
+
+`raymcp findings` gestiona los hallazgos sin MCP: es la que usa `tools/findings` en las ray-apps, y
+comparte `src/findings.ray` con el servidor, así que las reglas viven en un solo sitio.
+
+```sh
+raymcp findings new --app A --version V --type B --title "…" [--affects X] [--versions "…"]
+raymcp findings mark 170 ✅ --app A --version V --evidence "…" [--how "…"]
+raymcp findings history 170
+raymcp findings open [--type B] [--affects X] [--app Y]
+raymcp findings check
+raymcp findings index
+raymcp findings archive [--dry-run]
+```
+
+La convención está en `findings/README.md` de las ray-apps. Lo que imprime la herramienta va en
+inglés; lo que escribe en las campañas y en `INDEX.md`, en español, como el resto de esos datos.
 
 ## El agente
 

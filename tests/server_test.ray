@@ -74,8 +74,9 @@ fn add_finding_writes_and_refuses_duplicates() {
     let (ok, failed) = result_of(serve.handle(p, call_line(1, "add_finding", args)).unwrap());
     assert(!failed);
     assert(ok.starts_with("#6 added to findings/open/raybeta-1.27.65.md."));
-    // No tools/findings.py in the fixture: the index is left alone, and the answer says so.
-    assert(ok.contains("not regenerated"));
+    // The index is regenerated in the same step, and the answer says what it holds.
+    assert(ok.contains("findings/INDEX.md: 6 findings, 3 open"));
+    assert(fs.read_file("${tmp}/findings/INDEX.md").unwrap().contains("| 6 | B | abierto |"));
     let (dup, failed2) = result_of(serve.handle(p, call_line(2, "add_finding", args)).unwrap());
     assert(failed2);
     assert(dup.contains("#6 already has this title"));
