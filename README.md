@@ -37,17 +37,17 @@ raymcp fake-model SCRIPT [--port N]            un modelo con guion, compatible c
 | `search_findings` (solo lectura) | palabras que deben aparecer todas, y filtros por tipo, app, a quién afecta y estado; los más nuevos primero |
 | `get_finding` (solo lectura) | el texto completo de uno, con su archivo y estado |
 | `findings_summary` (solo lectura) | cuántos hay, y los abiertos por tipo, componente y app |
-| `add_finding` | uno nuevo, con el siguiente número global, en el archivo de campaña de su app y versión. Regenera `INDEX.md` con `tools/findings.py` si está |
+| `add_finding` | uno nuevo, con el siguiente número global, en el archivo de campaña de su app y versión. Regenera `INDEX.md` |
 
 Recursos: `findings://index` (`INDEX.md`) y `findings://convention` (`findings/README.md`). Las
 instrucciones del servidor piden buscar antes de crear. `add_finding` aplica las reglas de
-`tools/findings.py`:
+admisión:
 - quien encuentra no es el dueño;
 - el componente afectado tiene que ser uno conocido o una app;
 - el tipo es B, D, E o una combinación;
 - la versión es X.Y.Z.
 
-Además, rechaza un título repetido. Cada llamada vuelve a leer los archivos, así que lo que otro
+Además, rechaza un título repetido. Si la campaña estaba archivada, la devuelve a `open/`. Cada llamada vuelve a leer los archivos, así que lo que otro
 haya escrito ya está.
 
 Para usarlo desde Claude Code:
@@ -56,6 +56,24 @@ Para usarlo desde Claude Code:
 make build
 claude mcp add raymcp -- /ruta/a/raymcp/raymcp serve --root /ruta/a/ray-apps
 ```
+
+## La herramienta de línea de órdenes
+
+`raymcp findings` gestiona los hallazgos sin MCP: es la que usa `tools/findings` en las ray-apps, y
+comparte `src/findings.ray` con el servidor, así que las reglas viven en un solo sitio.
+
+```sh
+raymcp findings new --app A --version V --type B --title "…" [--affects X] [--versions "…"]
+raymcp findings mark 170 ✅ --app A --version V --evidence "…" [--how "…"]
+raymcp findings history 170
+raymcp findings open [--type B] [--affects X] [--app Y]
+raymcp findings check
+raymcp findings index
+raymcp findings archive [--dry-run]
+```
+
+La convención está en `findings/README.md` de las ray-apps. Lo que imprime la herramienta va en
+inglés; lo que escribe en las campañas y en `INDEX.md`, en español, como el resto de esos datos.
 
 ## El agente
 
@@ -135,7 +153,7 @@ make demo          # un turno del agente con el modelo con guion
 
 | Qué | Estado |
 |---|---|
-| Hallazgos, servidor, cliente, agente | **18 tests** en VM y nativo (raylang 1.27.73; agent, llm y mcp 0.2.1; net 0.10.1) |
+| Hallazgos, servidor, cliente, agente | **62 tests** en VM y nativo (raylang 1.27.110; agent y llm 0.2.1, mcp 0.3.1, net 0.11.4) |
 | De punta a punta | modelo con guion → agente → cliente MCP → `raymcp serve` en otro proceso → archivos: búsqueda, aprobación sí y no, `edits` y `auto`, streaming, reintentos (500, 429), cancelación y el límite de pasos |
 | Sobre los hallazgos reales | `tools`, `call` y `ask --fake` sobre los 221 hallazgos; el resumen coincide con `INDEX.md` |
 | Windows | en CI, con los tests del agente. Hasta raylang 1.27.73 se saltaban: un `accept` pendiente (el modelo con guion es un servidor HTTP) dejaba sin respuesta la sesión MCP con el hijo (#222) |
@@ -147,8 +165,10 @@ herramienta para cerrar hallazgos (poner la marca ✅ al volver a medir).
 
 ## Hallazgos de dogfood
 
-En `findings/` del directorio de las apps (`closed/2026-10/raymcp-1.27.65.md`, y la re-medición
-en `open/raymcp-1.27.73.md`). Los cinco quedaron arreglados en raylang 1.27.73 y los paquetes 0.2.1:
+En `findings/closed/` del directorio de las apps: `2026-10/raymcp-1.27.65.md` y su re-medición
+`2026-11/raymcp-1.27.73.md` (#217–#221, arreglados en raylang 1.27.73 y los paquetes 0.2.1), y
+`2026-11/raymcp-1.27.87.md` con su re-medición `2026-11/raymcp-1.27.108.md` (#306 y #307,
+arreglados en 1.27.108). Todos están cerrados:
 
 1. **#217 [D]** ✅ Bajo `ray test --native`, `launch_mode()` decía `"native"` y `self_command()` daba
    el binario de test, así que el servidor se lanzaba mal; la doc decía `"test"`. raymcp miraba
@@ -161,6 +181,11 @@ en `open/raymcp-1.27.73.md`). Los cinco quedaron arreglados en raylang 1.27.73 y
 4. **#220 [E]** ✅ Por MCP no se podía declarar una herramienta que escribe sin destruir, y `agent` la
    trataba como `EXEC`: en `edits` también preguntaba. Ahora `add_finding` es un `write_tool`.
 5. **#221 [D]** ✅ `ray doc` mostraba `-> Config` sin su módulo, y `llm/llm` no lo reexportaba.
+   raymcp importa `Config` y `ToolCall` de `llm/llm`.
+6. **#306 [E]** ✅ La CLI no aceptaba un directorio de proyecto (`ray check .`), y las herramientas
+   MCP sí. raymcp no dependía de ello.
+7. **#307 [E]** ✅ `string` no tenía `index_of_from`, y `after_word` (`src/findings.ray`) recortaba
+   el resto en cada vuelta y guardaba el carácter anterior. Ahora busca con `index_of_from`.
 
 Lo que salió bien:
 

@@ -8,7 +8,7 @@ import agent/agent;
 import llm/llm;
 import mcp/mcp;
 from agent/agent import Decision, Event;
-from llm/message import ToolCall;
+from llm/llm import ToolCall;
 from llm/llm import Config;
 
 pub struct Options {
@@ -135,7 +135,10 @@ pub fn open(o: Options) -> Result<Session, string> {
     };
     let fixed_answer = o.approve;
     if (fixed_answer == "") {
-        agent.on_approve(a, fn(call: ToolCall, risk: string) -> Decision { ask_terminal(call, risk) });
+        agent.on_approve(
+            a,
+            fn(call: ToolCall, risk: string) -> Decision { ask_terminal(call, risk) }
+        );
     } else {
         agent.on_approve(a, fn(call: ToolCall, risk: string) -> Decision { fixed(fixed_answer) });
     }

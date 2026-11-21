@@ -10,6 +10,7 @@ import agent/agent;
 import server;
 import ask;
 import fakemodel;
+import findings_cli;
 
 const USAGE: string = `raymcp — the ray-apps findings as an MCP server, and an agent that uses it
 
@@ -19,6 +20,7 @@ usage:
   raymcp call TOOL [JSON] [--root DIR]           call one tool through MCP
   raymcp ask [PROMPT] [options]                  the agent: one turn, or a conversation without PROMPT
   raymcp fake-model SCRIPT [--port N]            a scripted OpenAI-compatible model (tests, demos)
+  raymcp findings COMMAND [--root DIR]           manage the findings (raymcp findings help)
 
 ask options:
   --model M            default claude-opus-5-5 (Anthropic, key in ANTHROPIC_API_KEY)
@@ -309,6 +311,28 @@ fn cmd_fake(a: [string]) -> int {
     }
 }
 
+/// `--root` is raymcp's; the rest of the arguments belong to the findings command.
+fn cmd_findings(a: [string]) -> int {
+    var rest: [string] = [];
+    var i = 0;
+    while (i < a.len()) {
+        if (a[i] == "--root") {
+            i = i + 2;
+        } else {
+            rest.push(a[i]);
+            i = i + 1;
+        }
+    }
+    let r = findings_cli.run(root_of(a), rest);
+    for line in r.out {
+        print(line);
+    }
+    for line in r.err {
+        eprint(line);
+    }
+    r.code
+}
+
 fn main() -> int {
     let a = args();
     if (a.len() == 0) {
@@ -322,6 +346,7 @@ fn main() -> int {
         "call" => cmd_call(rest),
         "ask" => cmd_ask(rest),
         "fake-model" => cmd_fake(rest),
+        "findings" => cmd_findings(rest),
         "help" => {
             print(USAGE);
             0

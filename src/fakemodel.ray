@@ -179,9 +179,13 @@ pub fn start(script: string, port: int) -> Result<Running, string> {
         opts.drain_ms = 100;
         send(
             done,
-            webserver.serve_options_on(listener, opts, fn() -> fn(webserver.Request) -> webserver.Response {
-                fn(req: webserver.Request) -> webserver.Response { handle(req, inbox) }
-            })
+            webserver.serve_options_on(
+                listener,
+                opts,
+                fn() -> fn(webserver.Request) -> webserver.Response {
+                    fn(req: webserver.Request) -> webserver.Response { handle(req, inbox) }
+                }
+            )
         );
     });
     Result.Ok(Running { port: net.local_port(listener), inbox: inbox, stop: stop, done: done })

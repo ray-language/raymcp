@@ -1,0 +1,639 @@
+import std/fs;
+import std/time;
+import findings;
+import findings_cli;
+
+const TABLE: string = "| # | estado | evidencia |\n|---:|---|---|\n";
+
+/// A throwaway ray-apps root: findings/open, findings/closed/2026-10 and the app rayplay.
+fn setup() -> string {
+    let root = fs.make_temp_dir("raymcp-cli").unwrap();
+    fs.mkdir("${root}/findings/open").unwrap();
+    fs.mkdir("${root}/findings/closed/2026-10").unwrap();
+    fs.mkdir("${root}/rayplay").unwrap();
+    root
+}
+
+fn entry(n: int, mark: string) -> string {
+    let prefix = if (mark == "") { "" } else { "${mark} " };
+    "\n### ${n}. ${prefix}[B] t\n**App:** rayplay (raylang 1.27.50)\n\nbody\n"
+}
+
+fn write_open(root: string, name: string, text: string) {
+    fs.write_file("${root}/findings/open/${name}", text).unwrap();
+}
+
+fn write_closed(root: string, name: string, text: string) {
+    fs.write_file("${root}/findings/closed/2026-10/${name}", text).unwrap();
+}
+
+fn read_open(root: string, name: string) -> string {
+    fs.read_file("${root}/findings/open/${name}").unwrap()
+}
+
+fn open_exists(root: string, name: string) -> bool {
+    fs.exists("${root}/findings/open/${name}")
+}
+
+fn open_files(root: string) -> [string] {
+    sort(fs.list_dir("${root}/findings/open")
+        .unwrap()
+        .filter(fn(n: string) -> bool { n.ends_with(".md") }))
+}
+
+/// Every archived file name, whatever its month.
+fn archived(root: string) -> [string] {
+    var out: [string] = [];
+    for month in fs.list_dir("${root}/findings/closed").unwrap() {
+        out = out + fs.list_dir("${root}/findings/closed/${month}").unwrap();
+    }
+    sort(out)
+}
+
+fn all_output(r: findings_cli.Output) -> string {
+    (r.out + r.err).join("\n")
+}
+
+fn archive(root: string) -> string {
+    let r = findings_cli.run(root, ["archive"]);
+    assert_eq(r.code, 0);
+    all_output(r)
+}
+
+fn check(root: string) -> findings_cli.Output {
+    findings_cli.run(root, ["check"])
+}
+
+fn mark_as(
+    root: string,
+    n: string,
+    m: string,
+    version: string,
+    evidence: string
+) -> findings_cli.Output {
+    findings_cli.run(
+        root,
+        ["mark", n, m, "--app", "rayplay", "--version", version, "--evidence", evidence]
+    )
+}
+
+fn mark(root: string, n: string, m: string) -> findings_cli.Output {
+    mark_as(root, n, m, "1.27.61", "seen")
+}
+
+// ---- archive ----
+
+@test
+fn archives_a_remeasurement_without_entries_when_its_findings_are_closed() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    write_open(root, "rayplay-1.27.51.md", TABLE + "| 170 | ✅ | fixed |\n");
+    archive(root);
+    assert(archived(root).contains("rayplay-1.27.51.md"));
+    fs.remove_all(root);
+}
+
+@test
+fn a_stale_row_is_history_when_a_later_release_closed_the_finding() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    write_open(root, "rayplay-1.27.51.md", TABLE + "| 170 | ❌ | still failing |\n");
+    write_open(root, "rayplay-1.27.61.md", TABLE + "| 170 | ✅ | fixed |\n");
+    archive(root);
+    assert_eq(open_files(root).len(), 0);
+    fs.remove_all(root);
+}
+
+@test
+fn a_remeasurement_of_an_open_finding_stays() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, ""));
+    write_open(root, "rayplay-1.27.51.md", TABLE + "| 170 | ❌ | still failing |\n");
+    archive(root);
+    assert_eq(open_files(root).len(), 2);
+    fs.remove_all(root);
+}
+
+@test
+fn a_partial_header_keeps_the_campaign_open() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, "⚠️"));
+    archive(root);
+    assert(open_exists(root, "rayplay-1.27.50.md"));
+    fs.remove_all(root);
+}
+
+@test
+fn a_closed_entry_with_a_row_citing_an_open_finding_stays() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.49.md", entry(100, ""));
+    write_open(root, "rayplay-1.27.50.md", TABLE + "| 100 | ❌ | no |\n" + entry(170, "✅"));
+    archive(root);
+    assert(open_exists(root, "rayplay-1.27.50.md"));
+    fs.remove_all(root);
+}
+
+@test
+fn a_file_citing_nothing_or_an_unknown_finding_stays_and_warns() {
+    let root = setup();
+    write_open(root, "empty-1.27.50.md", "# nothing here\n");
+    write_open(root, "ghost-1.27.50.md", TABLE + "| 999 | ✅ | ? |\n");
+    let out = archive(root);
+    assert_eq(open_files(root).len(), 2);
+    assert(out.contains("cites no finding"));
+    assert(out.contains("#999"));
+    fs.remove_all(root);
+}
+
+@test
+fn numeric_rows_of_other_tables_are_not_findings() {
+    let root = setup();
+    write_open(
+        root,
+        "rayplay-1.27.50.md",
+        entry(170, "✅") + "\n| n | ms |\n|---|---|\n| 2500 | ✅ fast |\n"
+    );
+    archive(root);
+    assert(archived(root).contains("rayplay-1.27.50.md"));
+    fs.remove_all(root);
+}
+
+@test
+fn rows_citing_several_findings_count_all_of_them() {
+    let root = setup();
+    write_closed(root, "a-1.27.50.md", entry(201, "✅") + entry(202, "") + entry(203, "✅"));
+    write_open(root, "rayplay-1.27.73.md", TABLE + "| 201–203 | — | see later |\n");
+    archive(root);
+    assert(open_exists(root, "rayplay-1.27.73.md"));
+    fs.remove_all(root);
+}
+
+fn pad2(n: int) -> string {
+    if (n < 10) { "0${n}" } else { "${n}" }
+}
+
+@test
+fn archive_never_overwrites_an_archived_campaign() {
+    let root = setup();
+    let d = time.now_local();
+    let month = "${root}/findings/closed/${d.year}-${pad2(d.month)}";
+    fs.mkdir(month).unwrap();
+    fs.write_file("${month}/rayplay-1.27.50.md", entry(1, "✅")).unwrap();
+    write_open(root, "rayplay-1.27.50.md", entry(2, "✅"));
+    let out = archive(root);
+    assert(fs.read_file("${month}/rayplay-1.27.50.md").unwrap().contains("### 1."));
+    assert(open_exists(root, "rayplay-1.27.50.md"));
+    assert(out.contains("already exists"));
+    fs.remove_all(root);
+}
+
+@test
+fn a_dry_run_moves_nothing() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    let r = findings_cli.run(root, ["archive", "--dry-run"]);
+    assert_eq(r.code, 0);
+    assert(all_output(r).contains("(dry-run)"));
+    assert(open_exists(root, "rayplay-1.27.50.md"));
+    fs.remove_all(root);
+}
+
+// ---- check ----
+
+@test
+fn check_flags_an_open_header_with_a_closing_measurement() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, ""));
+    write_open(root, "rayplay-1.27.61.md", TABLE + "| 170 | ✅ | fixed |\n");
+    let r = check(root);
+    assert_eq(r.code, 1);
+    assert(all_output(r).contains("open header, but the latest measurement is ✅"));
+    fs.remove_all(root);
+}
+
+@test
+fn check_flags_a_possible_regression() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    write_open(root, "rayplay-1.27.61.md", TABLE + "| 170 | ❌ | broken again |\n");
+    let r = check(root);
+    assert_eq(r.code, 1);
+    assert(all_output(r).contains("regression?"));
+    fs.remove_all(root);
+}
+
+@test
+fn check_flags_an_open_header_in_closed() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, ""));
+    assert(all_output(check(root)).contains("open header in a file under closed/"));
+    fs.remove_all(root);
+}
+
+@test
+fn check_flags_an_archivable_campaign() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    assert(all_output(check(root)).contains("it can be archived"));
+    fs.remove_all(root);
+}
+
+@test
+fn check_flags_an_unrecognized_heading() {
+    let root = setup();
+    write_open(
+        root,
+        "rayplay-1.27.50.md",
+        entry(1, "") + "\n### 2. \u{26A0} [B] no variation selector\n"
+    );
+    assert(all_output(check(root)).contains("unrecognized heading"));
+    fs.remove_all(root);
+}
+
+@test
+fn check_flags_a_number_filed_twice() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(1, ""));
+    write_open(root, "rayplay-1.27.51.md", entry(1, ""));
+    assert(
+        all_output(check(root)).contains(
+            "#1 is in open/rayplay-1.27.50.md and in open/rayplay-1.27.51.md"
+        )
+    );
+    fs.remove_all(root);
+}
+
+@test
+fn check_does_not_trust_the_order_of_legacy_rows() {
+    let root = setup();
+    write_closed(
+        root,
+        "legacy-1.27.11-a-1.27.46.md",
+        entry(7, "✅") + "\n" + TABLE + "| 7 | ⚠️ | old |\n"
+    );
+    let r = check(root);
+    assert_eq(r.code, 0);
+    fs.remove_all(root);
+}
+
+@test
+fn check_uses_the_version_of_a_later_section_in_the_same_file() {
+    let root = setup();
+    let text = entry(170, "✅")
+        + "\n"
+        + TABLE
+        + "| 170 | ❌ | no |\n\n## Revisión con raylang 1.27.60 (15 oct)\n\n"
+        + TABLE
+        + "| 170 | ✅ | yes |\n";
+    write_closed(root, "rayplay-1.27.50.md", text);
+    write_closed(root, "rayplay-1.27.55.md", TABLE + "| 170 | ⚠️ | partly |\n");
+    let r = check(root);
+    assert_eq(all_output(r), "no warnings");
+    fs.remove_all(root);
+}
+
+// ---- history ----
+
+@test
+fn history_is_ordered_by_version_then_line() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅") + "\n" + TABLE + "| 170 | ❌ | a |\n");
+    write_closed(root, "rayplay-1.27.9.md", TABLE + "| 170 | ⚠️ | older |\n");
+    write_closed(
+        root,
+        "rayplay-1.27.61.md",
+        TABLE + "| 170 | ✅ 1.27.62 | c |\n| 170 | — | pointer |\n"
+    );
+    let r = findings_cli.run(root, ["history", "170"]);
+    assert_eq(r.code, 0);
+    assert(all_output(r).contains("1.27.9 ⚠️ → 1.27.50 ❌ → 1.27.62 ✅"));
+    assert(!all_output(r).contains("pointer"));
+    fs.remove_all(root);
+}
+
+@test
+fn a_remeasure_note_outside_a_heading_sets_the_version_of_what_follows() {
+    let root = setup();
+    write_closed(
+        root,
+        "rayplay-1.27.50.md",
+        entry(170, "✅")
+            + "\nRe-medido el 2 Oct con elements 1.0.0 (raylang 1.27.86, VM).\n\n"
+            + TABLE
+            + "| 170 | ✅ | c |\n"
+    );
+    assert(all_output(findings_cli.run(root, ["history", "170"])).contains("1.27.86 ✅"));
+    fs.remove_all(root);
+}
+
+@test
+fn history_of_an_unknown_finding_fails() {
+    let root = setup();
+    assert_eq(findings_cli.run(root, ["history", "42"]).code, 1);
+    assert_eq(findings_cli.run(root, ["history", "x"]).code, 2);
+    fs.remove_all(root);
+}
+
+// ---- mark ----
+
+@test
+fn mark_sets_the_header_and_creates_the_campaign_row() {
+    let root = setup();
+    write_open(
+        root,
+        "rayplay-1.27.50.md",
+        "### 170. [B] a title\n**App:** rayplay (raylang 1.27.50)\n"
+    );
+    let r = mark_as(root, "170", "✅", "1.27.61", "line one\nline | two");
+    assert_eq(r.code, 0);
+    assert(read_open(root, "rayplay-1.27.50.md").contains("### 170. ✅ [B] a title"));
+    let campaign = read_open(root, "rayplay-1.27.61.md");
+    assert(campaign.contains("| 170 | ✅ 1.27.61 | line one line \\| two |"));
+    assert(all_output(findings_cli.run(root, ["history", "170"])).contains("1.27.61 ✅"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_keeps_the_how_it_was_measured() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, ""));
+    let r = findings_cli.run(
+        root,
+        [
+            "mark",
+            "170",
+            "✅",
+            "--app",
+            "rayplay",
+            "--version",
+            "1.27.61",
+            "--evidence",
+            "seen",
+            "--how",
+            "a fixture."
+        ]
+    );
+    assert_eq(r.code, 0);
+    assert(read_open(root, "rayplay-1.27.61.md").contains("Cómo se midió: a fixture."));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_then_archive_closes_both_files() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, ""));
+    mark(root, "170", "✅");
+    archive(root);
+    assert_eq(open_files(root).len(), 0);
+    fs.remove_all(root);
+}
+
+@test
+fn mark_in_the_findings_own_campaign_applies_both_edits() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.61.md", "# c\n\n" + TABLE + "\n" + entry(170, ""));
+    mark(root, "170", "❌");
+    let text = read_open(root, "rayplay-1.27.61.md");
+    assert(text.contains("### 170. ❌ [B]"));
+    assert(text.contains("| 170 | ❌ 1.27.61 | seen |"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_appends_to_the_last_status_table() {
+    let root = setup();
+    write_open(
+        root,
+        "rayplay-1.27.61.md",
+        TABLE + "| 1 | ✅ | a |\n\nmid\n\n" + TABLE + "| 2 | ✅ | b |\n\nend\n"
+    );
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    mark(root, "170", "✅");
+    assert(
+        read_open(root, "rayplay-1.27.61.md").contains(
+            "| 2 | ✅ | b |\n| 170 | ✅ 1.27.61 | seen |\n"
+        )
+    );
+    fs.remove_all(root);
+}
+
+@test
+fn mark_keeps_the_width_of_extra_columns() {
+    let root = setup();
+    write_open(
+        root,
+        "rayplay-1.27.61.md",
+        "| # | estado | evidencia | adoptado en |\n|---:|---|---|---|\n| 1 | ✅ | a | b |\n"
+    );
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    mark(root, "170", "✅");
+    assert(read_open(root, "rayplay-1.27.61.md").contains("| 170 | ✅ 1.27.61 | seen | — |"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_adds_a_table_before_the_entries_when_the_file_has_none() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.61.md", "# c\n" + entry(1, "✅"));
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    mark(root, "170", "✅");
+    let text = read_open(root, "rayplay-1.27.61.md");
+    assert(text.index_of("| 170 |").unwrap() < text.index_of("### 1.").unwrap());
+    fs.remove_all(root);
+}
+
+@test
+fn a_regression_moves_the_home_file_back_to_open() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    let r = mark(root, "170", "❌");
+    assert_eq(r.code, 0);
+    assert(all_output(r).contains("reopened"));
+    assert(!fs.exists("${root}/findings/closed/2026-10/rayplay-1.27.50.md"));
+    assert(read_open(root, "rayplay-1.27.50.md").contains("### 170. ❌"));
+    assert_eq(check(root).code, 0);
+    fs.remove_all(root);
+}
+
+@test
+fn a_closing_mark_leaves_the_closed_home_in_place() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "❌"));
+    mark(root, "170", "✅");
+    assert(fs.read_file("${root}/findings/closed/2026-10/rayplay-1.27.50.md")
+        .unwrap()
+        .contains("### 170. ✅"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_restores_an_archived_campaign_instead_of_duplicating_it() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.50.md", entry(170, "✅"));
+    write_closed(root, "rayplay-1.27.61.md", TABLE + "| 1 | ✅ | a |\n" + entry(1, "✅"));
+    mark(root, "170", "✅");
+    let restored = read_open(root, "rayplay-1.27.61.md");
+    assert(restored.contains("| 1 | ✅ | a |"));
+    assert(restored.contains("| 170 | ✅ 1.27.61 | seen |"));
+    assert(!fs.exists("${root}/findings/closed/2026-10/rayplay-1.27.61.md"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_restores_when_the_campaign_is_also_the_home() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.61.md", "# c\n\n" + TABLE + "\n" + entry(170, "✅"));
+    let r = mark(root, "170", "❌");
+    assert_eq(r.code, 0);
+    assert_eq(archived(root).len(), 0);
+    assert(read_open(root, "rayplay-1.27.61.md").contains("### 170. ❌"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_refuses_a_version_older_than_the_latest_measurement() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, ""));
+    write_open(root, "rayplay-1.27.61.md", TABLE + "| 170 | ❌ | no |\n");
+    let r = mark_as(root, "170", "✅", "1.27.55", "seen");
+    assert_eq(r.code, 1);
+    assert(all_output(r).contains("older"));
+    assert(!open_exists(root, "rayplay-1.27.55.md"));
+    assert(!read_open(root, "rayplay-1.27.50.md").contains("✅"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_normalizes_a_warning_sign_without_its_variation_selector() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, ""));
+    assert_eq(mark(root, "170", "\u{26A0}").code, 0);
+    assert(read_open(root, "rayplay-1.27.50.md").contains("### 170. ⚠️ [B]"));
+    fs.remove_all(root);
+}
+
+@test
+fn mark_rejects_bad_input_without_touching_files() {
+    let root = setup();
+    write_open(root, "rayplay-1.27.50.md", entry(170, ""));
+    let before = read_open(root, "rayplay-1.27.50.md");
+    assert_eq(mark(root, "170", "OK").code, 1);
+    assert_eq(mark(root, "999", "✅").code, 1);
+    assert_eq(mark_as(root, "170", "✅", "1.27.61", "  ").code, 1);
+    assert_eq(mark_as(root, "170", "✅", "1.27", "seen").code, 2);
+    assert_eq(
+        findings_cli.run(
+            root,
+            ["mark", "170", "✅", "--app", "nope", "--version", "1.27.61", "--evidence", "x"]
+        ).code,
+        1
+    );
+    assert_eq(findings_cli.run(root, ["mark", "170", "✅", "--app", "rayplay"]).code, 2);
+    assert_eq(read_open(root, "rayplay-1.27.50.md"), before);
+    assert_eq(open_files(root), ["rayplay-1.27.50.md"]);
+    fs.remove_all(root);
+}
+
+// ---- new, open, index, arguments ----
+
+@test
+fn new_reuses_an_archived_campaign() {
+    let root = setup();
+    write_closed(root, "rayplay-1.27.61.md", entry(1, "✅"));
+    let r = findings_cli.run(
+        root,
+        ["new", "--app", "rayplay", "--version", "1.27.61", "--type", "B", "--title", "x"]
+    );
+    assert_eq(r.code, 0);
+    let text = read_open(root, "rayplay-1.27.61.md");
+    assert(text.contains("### 1. ✅"));
+    assert(text.contains("### 2. [B] x"));
+    assert_eq(archived(root).len(), 0);
+    fs.remove_all(root);
+}
+
+@test
+fn new_applies_the_admission_rules() {
+    let root = setup();
+    let base = ["new", "--app", "rayplay", "--version", "1.27.61", "--type", "B", "--title", "x"];
+    assert(all_output(findings_cli.run(root, base + ["--affects", "rayplay"])).contains("itself"));
+    assert_eq(findings_cli.run(root, base + ["--affects", "nobody"]).code, 1);
+    assert_eq(findings_cli.run(root, base + ["--afecta", "net"]).code, 2);
+    assert_eq(findings_cli.run(root, base + ["--affects", "oidc"]).code, 0);
+    assert_eq(findings_cli.run(root, base + ["--affects=mcp"]).code, 0);
+    fs.remove_all(root);
+}
+
+@test
+fn open_lists_what_is_not_closed_and_filters() {
+    let root = setup();
+    write_open(
+        root,
+        "rayplay-1.27.50.md",
+        entry(1, "")
+            + entry(2, "⚠️")
+            + entry(3, "✅")
+            + "\n### 4. [E] e\n**App:** rayplay (raylang 1.27.50)\n**Afecta a:** net\n"
+    );
+    let all = findings_cli.run(root, ["open"]);
+    assert_eq(all.out.len(), 3);
+    assert(all.out[0].starts_with("#1 [B]  abierto  affects raylang"));
+    assert(all.out[1].contains("      ⚠️  affects raylang"));
+    assert_eq(findings_cli.run(root, ["open", "--type", "E"]).out.len(), 1);
+    assert_eq(findings_cli.run(root, ["open", "--affects", "net"]).out.len(), 1);
+    assert_eq(findings_cli.run(root, ["open", "--app", "other"]).out.len(), 0);
+    fs.remove_all(root);
+}
+
+@test
+fn the_index_groups_the_open_ones_by_target_with_raylang_first() {
+    let root = setup();
+    write_open(
+        root,
+        "rayplay-1.27.50.md",
+        entry(1, "")
+            + "\n### 2. [E] e\n**App:** rayplay (raylang 1.27.50, net 0.1)\n**Afecta a:** net\n\n### 3. [E] f\n**App:** rayplay (raylang 1.27.50)\n**Afecta a:** net\n"
+    );
+    let r = findings_cli.run(root, ["index"]);
+    assert_eq(r.out[0], "findings/INDEX.md: 3 findings, 3 open (**net** 2 · **raylang** 1)");
+    let text = fs.read_file("${root}/findings/INDEX.md").unwrap();
+    assert(
+        text.contains(
+            "**3 abiertos** (1 de tipo B). Abiertos por componente afectado: **net** 2 · **raylang** 1."
+        )
+    );
+    assert(
+        text.index_of("## Abiertos — afecta a raylang (1)").unwrap() < text.index_of("## Abiertos — afecta a net (2)").unwrap()
+    );
+    assert(
+        text.contains(
+            "| 2 | E | abierto | net | rayplay | 1.27.50 | e | — | [rayplay-1.27.50](open/rayplay-1.27.50.md) |"
+        )
+    );
+    fs.remove_all(root);
+}
+
+@test
+fn a_wrong_call_is_exit_2_and_a_missing_tree_exit_1() {
+    let root = setup();
+    assert_eq(findings_cli.run(root, []).code, 2);
+    assert_eq(findings_cli.run(root, ["nope"]).code, 2);
+    assert_eq(findings_cli.run(root, ["help"]).code, 0);
+    assert_eq(findings_cli.run(root, ["archive", "--bogus"]).code, 2);
+    assert_eq(findings_cli.run("${root}/rayplay", ["check"]).code, 1);
+    fs.remove_all(root);
+}
+
+@test
+fn row_numbers_parse_every_form_the_campaigns_use() {
+    assert_eq(findings.parse_row_numbers(" 170 ").unwrap(), [170]);
+    assert_eq(findings.parse_row_numbers(" 28 / 39 ").unwrap(), [28, 39]);
+    assert_eq(findings.parse_row_numbers(" 201–203 ").unwrap(), [201, 202, 203]);
+    assert_eq(findings.parse_row_numbers(" 189, 223–225 ").unwrap(), [189, 223, 224, 225]);
+    assert_eq(findings.parse_row_numbers(" 100 (#7) ").unwrap(), [100]);
+    assert_eq(findings.parse_row_numbers(" #5 ").unwrap(), [5]);
+    assert(findings.parse_row_numbers("foo").is_none());
+    assert(findings.parse_row_numbers("").is_none());
+    assert(findings.parse_row_numbers(" 5–3 ").is_none());
+    assert(findings.parse_row_numbers("1,").is_none());
+}
