@@ -318,13 +318,21 @@ fn report_index(root: string, o: Output) {
 fn write_atomic(path: string, text: string) -> Result<int, string> {
     let mode = fs.stat(path)?.mode;
     let tmp = "${path}.tmp-${time.monotonic_nanos()}";
+    // chmod only when the modes differ: on Windows it always fails, and there they never do.
     let written = fs.write_file(tmp, text)
-        .and_then(fn(_: int) -> Result<int, string> { fs.chmod(tmp, mode) })
+        .and_then(fn(_: int) -> Result<int, string> { keep_mode(tmp, mode) })
         .and_then(fn(_: int) -> Result<int, string> { fs.rename(tmp, path) });
     if (written.is_err() && fs.exists(tmp)) {
         fs.remove_file(tmp);
     }
     written
+}
+
+fn keep_mode(path: string, mode: int) -> Result<int, string> {
+    if (fs.stat(path)?.mode == mode) {
+        return Result.Ok(0);
+    }
+    fs.chmod(path, mode)
 }
 
 pub fn set_header_mark(text: string, n: int, mark: string) -> Result<string, string> {
